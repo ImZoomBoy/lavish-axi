@@ -2934,6 +2934,18 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
       assert.equal(feedback.session_ended, true);
       assert.equal(feedback.ended_by, "user");
       assert.equal(feedback.prompts.length, 1);
+      assert.match(feedback.feedback_id, /^[0-9a-f-]{36}$/);
+
+      const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+      });
+      assert.equal(acknowledged.status, 200);
+      assert.deepEqual(await acknowledged.json(), {
+        status: "acknowledged",
+        feedback_id: feedback.feedback_id,
+      });
 
       const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
       const endedBody = await ended.json();

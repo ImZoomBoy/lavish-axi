@@ -66,6 +66,7 @@ const warningsSelected = /** @type {HTMLSpanElement} */ (document.getElementById
 const warningsList = /** @type {HTMLDivElement} */ (document.getElementById("warningsList"));
 const warningsQueueButton = /** @type {HTMLButtonElement} */ (document.getElementById("warningsQueueButton"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
+const feedbackStatusElement = /** @type {HTMLDivElement} */ (document.getElementById("feedbackStatus"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
@@ -99,6 +100,8 @@ let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
 let submitQueuedAgain = false;
+let feedbackDeliveryStatus = "idle";
+let feedbackDeliveryId = "";
 let lastScroll = { x: 0, y: 0 };
 // In-iframe review context (an open annotation card's unsent text, Lavish-owned question
 // answers). The sandbox means the chrome cannot read it back after a reload, so the SDK reports
@@ -346,6 +349,7 @@ function scrollElementIntoView(el) {
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   queued.splice(index, 1);
+  if (queued.length === 0 && feedbackDeliveryStatus === "queued") setFeedbackStatus("idle");
   persistQueuedPrompts();
   render();
 }
@@ -369,6 +373,7 @@ function enqueuePrompt(prompt) {
     queued.push(prompt);
   }
 
+  setFeedbackStatus("queued");
   persistQueuedPrompts();
   render();
 }
@@ -396,6 +401,7 @@ function sendQueued(endAfter) {
   const text = chatInput.value.trim();
   if (text) {
     queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
+    setFeedbackStatus("queued");
     persistQueuedPrompts();
     addChat("user", text);
     chatInput.value = "";
@@ -464,6 +470,7 @@ async function submitQueuedOnce() {
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  setFeedbackStatus("sent");
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;
@@ -477,6 +484,24 @@ function normalizeLayoutFindings(value) {
   return Array.isArray(value)
     ? value.filter((item) => item && typeof item === "object" && String(item.severity || "").toLowerCase() === "error")
     : [];
+}
+
+function setFeedbackStatus(status, feedbackId = "") {
+  feedbackDeliveryStatus = status;
+  if (status === "queued" || status === "sent" || status === "idle") feedbackDeliveryId = "";
+  if (feedbackId) feedbackDeliveryId = String(feedbackId);
+  if (!feedbackStatusElement) return;
+
+  const copy = {
+    idle: "",
+    queued: "Queued locally. Press Send to Agent when ready.",
+    sent: "Sent to Lavish. Waiting for the agent to receive it.",
+    delivered: "Delivered to the agent. The agent is working on it.",
+    acknowledged: "The agent acknowledged this feedback.",
+  }[status];
+  feedbackStatusElement.textContent = copy || "";
+  feedbackStatusElement.hidden = !copy;
+  feedbackStatusElement.dataset.state = status;
 }
 
 function clearLayoutGateTimer() {
@@ -1849,6 +1874,14 @@ events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse
 events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
 // A reconnecting stream means this chrome may have missed updates while it was away.
 events.addEventListener("open", () => refreshLayoutWarnings());
+events.addEventListener("feedback-delivered", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  setFeedbackStatus("delivered", feedbackId);
+});
+events.addEventListener("feedback-acknowledged", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  if (!feedbackDeliveryId || feedbackDeliveryId === String(feedbackId)) setFeedbackStatus("acknowledged", feedbackId);
+});
 
 render();
 setWarningsDrawerOpen(false);

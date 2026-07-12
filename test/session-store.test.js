@@ -31,12 +31,16 @@ function diagnosticPayload(load, sequence, body = {}) {
 
 function feedbackResult(result) {
   assert.equal(result.status, "feedback");
-  return /** @type {{ status: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
+  return /** @type {{ status: string, feedback_id: string, dom_snapshot: string, prompts: any[], artifact_failures?: any[], session_ended?: boolean, ended_by?: string }} */ (
     result
   );
 }
 
-test("queued prompts are returned with DOM snapshot context and then cleared", async () => {
+async function acknowledge(store, key, result) {
+  return store.acknowledgeFeedback(key, result.feedback_id);
+}
+
+test("queued prompts are redelivered until the agent acknowledges the batch", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {
     const stateFile = path.join(dir, "state.json");
@@ -56,8 +60,52 @@ test("queued prompts are returned with DOM snapshot context and then cleared", a
       { uid: "1", prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" },
     ]);
 
-    const second = await store.takeFeedback(session.key);
-    assert.equal(second.status, "waiting");
+    const retry = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(retry.feedback_id, first.feedback_id);
+    assert.deepEqual(retry.prompts, first.prompts);
+    assert.deepEqual(await store.acknowledgeFeedback(session.key, "wrong-feedback-id"), {
+      status: "mismatch",
+      feedback_id: first.feedback_id,
+    });
+    assert.deepEqual(await acknowledge(store, session.key, first), {
+      status: "acknowledged",
+      feedback_id: first.feedback_id,
+    });
+    assert.deepEqual(await store.acknowledgeFeedback(session.key, first.feedback_id), {
+      status: "already-acknowledged",
+      feedback_id: first.feedback_id,
+    });
+    assert.equal((await store.takeFeedback(session.key)).status, "waiting");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("feedback queued while the agent works waits for the next acknowledged batch", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, { prompts: [{ prompt: "First", selector: "h1", tag: "h1", text: "Hello" }] });
+    const first = feedbackResult(await store.takeFeedback(session.key));
+
+    await store.queuePrompts(session.key, {
+      prompts: [{ prompt: "Second", selector: "h1", tag: "h1", text: "Hello" }],
+    });
+    const retry = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(retry.feedback_id, first.feedback_id);
+
+    assert.deepEqual(await acknowledge(store, session.key, first), {
+      status: "acknowledged",
+      feedback_id: first.feedback_id,
+    });
+    const second = feedbackResult(await store.takeFeedback(session.key));
+    assert.notEqual(second.feedback_id, first.feedback_id);
+    assert.equal(second.prompts[0].prompt, "Second");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -702,6 +750,7 @@ test("fatal artifact failures still reach the agent without user action", async 
     const feedback = feedbackResult(await store.takeFeedback(session.key));
     assert.equal(feedback.artifact_failures.length, 1);
     assert.equal(feedback.artifact_failures[0].severity, "fatal");
+    await acknowledge(store, session.key, feedback);
     assert.equal((await store.takeFeedback(session.key)).status, "waiting");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -850,6 +899,8 @@ test("the final feedback batch before an end flags session_ended with who ended 
     assert.equal(first.session_ended, true);
     assert.equal(first.ended_by, "user");
 
+    await acknowledge(store, session.key, first);
+
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "ended");
     assert.equal(second.ended_by, "user");
@@ -877,6 +928,8 @@ test("queued prompts can atomically carry a browser end intent", async () => {
     assert.equal(first.session_ended, true);
     assert.equal(first.ended_by, "user");
     assert.equal(first.prompts.length, 1);
+
+    await acknowledge(store, session.key, first);
 
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "ended");
@@ -909,6 +962,8 @@ test("late prompts after a user end preserve the ended session state", async () 
     assert.equal(first.session_ended, true);
     assert.equal(first.ended_by, "user");
     assert.equal(first.prompts[0].prompt, "Late feedback");
+
+    await acknowledge(store, session.key, first);
 
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "ended");
@@ -968,6 +1023,8 @@ test("prompts queued before ending are still delivered before the ended status",
     assert.equal(first.dom_snapshot, 'uid=1 h1 "Hello"');
 
     // Delivering the final batch must not resurrect the session.
+    await acknowledge(store, session.key, first);
+
     const second = await store.takeFeedback(session.key);
     assert.equal(second.status, "ended");
   } finally {

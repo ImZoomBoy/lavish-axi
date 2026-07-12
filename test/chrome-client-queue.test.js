@@ -1577,6 +1577,34 @@ test("chrome client strips the internal queue key before posting prompts", async
   assert.equal(chrome.queued().length, 0);
 });
 
+test("chrome shows queued, sent, delivered, and acknowledged feedback states", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: "queued" }) }),
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Review the title", selector: "h1", tag: "annotation", text: "Title" },
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "queued");
+
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 h1" });
+  await flushPromises();
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "sent");
+  assert.match(chrome.element("feedbackStatus").textContent, /Sent to Lavish/);
+
+  chrome.eventSource().listeners.get("feedback-delivered")({
+    data: JSON.stringify({ feedback_id: "feedback-1" }),
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "delivered");
+
+  chrome.eventSource().listeners.get("feedback-acknowledged")({
+    data: JSON.stringify({ feedback_id: "feedback-1" }),
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "acknowledged");
+});
+
 test("chrome send and end carries the end intent with queued prompts", async () => {
   const posts = [];
   const chrome = await createChromeHarness({
