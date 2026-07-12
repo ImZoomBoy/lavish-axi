@@ -18,8 +18,13 @@ async function createChromeHarness({
   storage = new Map(),
   beginLoadResponses = [],
   handoffResponses = [],
+  initialQueued = [],
+  initialPendingSubmission = null,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
+  if (initialQueued.length) storage.set("lavish-axi:queued:abc", JSON.stringify(initialQueued));
+  if (initialPendingSubmission)
+    storage.set("lavish-axi:submission:abc", JSON.stringify(initialPendingSubmission));
   const postedToFrame = [];
   const postedToWhiteboard = [];
   const inlineWhiteboards = [];
@@ -494,6 +499,16 @@ test("stale re-handshake responses cannot overwrite a newer load", async () => {
   assert.match(lastRequest.init.body, /new-handoff/);
   assert.doesNotMatch(lastRequest.init.body, /old-recovery/);
   assert.equal(chrome.element("handoffBanner").hidden, true);
+});
+
+test("chrome restores the queued feedback status after reload", async () => {
+  const chrome = await createChromeHarness({
+    initialQueued: [{ prompt: "Review the title", selector: "h1", tag: "annotation", text: "Title" }],
+  });
+
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "queued");
+  assert.equal(chrome.element("feedbackStatus").hidden, false);
+  assert.match(chrome.element("feedbackStatus").textContent, /Queued locally/);
 });
 
 test("chrome client replaces queued prompts with the same internal key", async () => {
@@ -1570,7 +1585,9 @@ test("chrome client strips the internal queue key before posting prompts", async
 
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/abc/prompts");
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Use plan B", selector: "input#plan-b", tag: "choice", text: "Plan B" }],
     domSnapshot: "uid=1 body",
   });
@@ -1629,7 +1646,9 @@ test("chrome send and end carries the end intent with queued prompts", async () 
     posts.map((post) => post.url),
     ["/api/abc/prompts"],
   );
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
     endSession: true,
@@ -1694,7 +1713,9 @@ test("chrome send and end during an in-flight submit still ends after the submit
     posts.map((post) => post.url),
     ["/api/abc/prompts", "/api/abc/end"],
   );
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
   });

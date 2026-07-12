@@ -8,6 +8,7 @@ const queueStorageKey = "lavish-axi:queued:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
 const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
+const submissionStorageKey = "lavish-axi:submission:" + key;
 const internalQueueKeyField = "_lavishQueueKey";
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
@@ -74,6 +75,7 @@ const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
+let pendingSubmission = loadPendingSubmission();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
@@ -188,7 +190,40 @@ function persistQueuedPrompts() {
   }
 }
 
+function loadPendingSubmission() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(submissionStorageKey) || "null");
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.submission_id !== "string" ||
+      !parsed.submission_id ||
+      !Array.isArray(parsed.prompts) ||
+      !parsed.body ||
+      typeof parsed.body !== "object"
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function persistPendingSubmission() {
+  try {
+    if (pendingSubmission) {
+      sessionStorage.setItem(submissionStorageKey, JSON.stringify(pendingSubmission));
+    } else {
+      sessionStorage.removeItem(submissionStorageKey);
+    }
+  } catch {
+    // The in-memory submission still protects retries if browser storage is unavailable.
+  }
+}
+
 function render() {
+  if (queued.length && feedbackDeliveryStatus === "idle") setFeedbackStatus("queued");
   annotationPills.innerHTML = queued
     .map(
       (prompt, index) =>
@@ -447,10 +482,24 @@ async function submitQueued() {
 }
 
 async function submitQueuedOnce() {
-  const prompts = queued.slice();
-  const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
-  if (shouldEndSession) body.endSession = true;
+  const submission =
+    pendingSubmission ||
+    (() => {
+      const prompts = queued.slice();
+      const submissionId = createSubmissionId();
+      const body = {
+        submission_id: submissionId,
+        prompts: prompts.map(stripInternalPromptFields),
+        domSnapshot: pendingSnapshot,
+      };
+      if (endAfterSubmit) body.endSession = true;
+      const created = { submission_id: submissionId, prompts, body };
+      pendingSubmission = created;
+      persistPendingSubmission();
+      return created;
+    })();
+  const { prompts, body } = submission;
+  const shouldEndSession = Boolean(body.endSession);
   const response = await fetch("/api/" + key + "/prompts", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -465,6 +514,8 @@ async function submitQueuedOnce() {
     }
     throw new Error("failed to submit queued prompts");
   }
+  pendingSubmission = null;
+  persistPendingSubmission();
   for (const prompt of prompts) {
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
@@ -1031,6 +1082,11 @@ async function exportArtifact() {
   } finally {
     exportArtifactButton.disabled = false;
   }
+}
+
+function createSubmissionId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `lavish-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function openShareDialog() {

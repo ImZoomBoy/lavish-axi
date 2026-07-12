@@ -373,7 +373,11 @@ export async function serve({
         res.status(409).json(result);
         return;
       }
-      events.emit("feedback-acknowledged", req.params.key, result.feedback_id);
+      if (result.status === "acknowledged") {
+        markFeedbackAcknowledged(req.params.key, activePolls, deliveredFeedback, events, result.feedback_id);
+      } else {
+        events.emit("feedback-acknowledged", req.params.key, result.feedback_id);
+      }
       res.json(result);
     } catch (error) {
       next(error);
@@ -1346,10 +1350,14 @@ function setPollActive(key, activePolls, deliveredFeedback, events, active) {
 }
 
 function markFeedbackDelivered(key, activePolls, deliveredFeedback, events, feedbackId = "") {
+  if (feedbackId) events.emit("feedback-delivered", key, feedbackId);
+}
+
+function markFeedbackAcknowledged(key, activePolls, deliveredFeedback, events, feedbackId = "") {
   const previousPresence = computePresence(key, activePolls, deliveredFeedback);
   deliveredFeedback.add(key);
+  if (feedbackId) events.emit("feedback-acknowledged", key, feedbackId);
   const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (feedbackId) events.emit("feedback-delivered", key, feedbackId);
   if (nextPresence !== previousPresence) {
     events.emit("agent-presence", key, nextPresence);
   }

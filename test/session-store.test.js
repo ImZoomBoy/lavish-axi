@@ -81,6 +81,60 @@ test("queued prompts are redelivered until the agent acknowledges the batch", as
   }
 });
 
+test("concurrent polls reserve one stable feedback batch", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, {
+      prompts: [{ prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" }],
+    });
+
+    const [first, second] = await Promise.all([store.takeFeedback(session.key), store.takeFeedback(session.key)]);
+    assert.equal(first.status, "feedback");
+    assert.equal(second.status, "feedback");
+    assert.equal(first.feedback_id, second.feedback_id);
+    assert.deepEqual(await acknowledge(store, session.key, first), {
+      status: "acknowledged",
+      feedback_id: first.feedback_id,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("repeated browser submissions with one idempotency key do not duplicate prompts", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    const submission = {
+      submission_id: "submission-1",
+      prompts: [{ prompt: "Make this warmer", selector: "h1", tag: "h1", text: "Hello" }],
+    };
+    await store.queuePrompts(session.key, submission);
+    await store.queuePrompts(session.key, submission);
+
+    const result = feedbackResult(await store.takeFeedback(session.key));
+    assert.equal(result.prompts.length, 1);
+    assert.equal(result.prompts[0].prompt, "Make this warmer");
+    assert.deepEqual(await acknowledge(store, session.key, result), {
+      status: "acknowledged",
+      feedback_id: result.feedback_id,
+    });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("feedback queued while the agent works waits for the next acknowledged batch", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
   try {

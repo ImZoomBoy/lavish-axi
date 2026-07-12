@@ -67,6 +67,7 @@ export class SessionStore {
         status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
         pending_prompts: existing.pending_prompts || 0,
         inflight_feedback: existing.inflight_feedback || null,
+        accepted_submission_ids: existing.accepted_submission_ids || [],
         prompts: existingPrompts,
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
         // must never silently drop unresolved warnings the user has not triaged yet.
@@ -89,6 +90,11 @@ export class SessionStore {
       const session = state.sessions[key];
       if (!session) {
         return null;
+      }
+      const submissionId = normalizeSubmissionId(payload);
+      const acceptedSubmissionIds = session.accepted_submission_ids || [];
+      if (submissionId && acceptedSubmissionIds.includes(submissionId)) {
+        return session;
       }
       const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
       const shouldEndSession = Boolean(payload.endSession || payload.end_session);
@@ -144,6 +150,9 @@ export class SessionStore {
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
       session.status = shouldEndSession || alreadyEnded ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
       if (shouldEndSession) session.ended_by = "user";
+      if (submissionId) {
+        session.accepted_submission_ids = [...acceptedSubmissionIds, submissionId].slice(-200);
+      }
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
@@ -429,9 +438,9 @@ export class SessionStore {
       if (!session) {
         return { status: "missing" };
       }
-      // Keep a delivered batch durable until the CLI acknowledges receipt. If a poll response is
-      // interrupted after the server reserved the batch, the next poll receives the same batch
-      // instead of silently losing the user's feedback.
+      // Keep a delivered batch durable until the agent acknowledges it after processing. If a
+      // poll response is interrupted, the next poll receives the same batch instead of silently
+      // losing the user's feedback.
       if (session.inflight_feedback) {
         return feedbackDeliveryResult(session.inflight_feedback);
       }
@@ -561,6 +570,12 @@ export class SessionStore {
   async writeState(state) {
     await writeFile(this.file, `${JSON.stringify(state, null, 2)}\n`);
   }
+}
+
+function normalizeSubmissionId(payload) {
+  const value = payload?.submission_id || payload?.submissionId;
+  const normalized = String(value || "").trim();
+  return normalized || null;
 }
 
 function feedbackDeliveryResult(delivery) {
