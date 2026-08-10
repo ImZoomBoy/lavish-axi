@@ -517,6 +517,7 @@ async function submitQueuedOnce() {
   pendingSubmission = null;
   persistPendingSubmission();
   for (const prompt of prompts) {
+    if (prompt.tag !== "message") addChat("user", prompt.prompt);
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }

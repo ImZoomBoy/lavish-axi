@@ -3352,8 +3352,14 @@ test("SSE agent-presence returns to waiting after an agent reply", async () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      // A poll that drains the feedback and releases leaves presence "working".
-      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      // A poll that drains the feedback and releases leaves presence "waiting" until the
+      // agent acknowledges the batch; the acknowledgement is what marks it "working".
+      const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
+      await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+      });
       assert.equal(await presence.next(), "working");
 
       // The reply concludes that work. Without a clear here, presence stays "working"

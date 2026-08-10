@@ -1131,3 +1131,34 @@ test("freeform user prompts are stored in session chat history", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("annotation prompts are stored in session chat history", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-store-"));
+  try {
+    const stateFile = path.join(dir, "state.json");
+    const artifact = path.join(dir, "artifact.html");
+    await writeFile(artifact, "<h1>Hello</h1>");
+
+    const store = new SessionStore(stateFile);
+    const session = await store.upsertSession(artifact, "http://localhost:4387/session/test");
+    await store.queuePrompts(session.key, {
+      prompts: [
+        {
+          uid: "heading",
+          prompt: "Show total token usage for each pipeline stage",
+          selector: "h1",
+          tag: "annotation",
+          text: "Usage heading",
+        },
+      ],
+    });
+
+    const updated = await store.findByKey(session.key);
+    assert.deepEqual(
+      updated.chat.map((item) => [item.role, item.text]),
+      [["user", "Show total token usage for each pipeline stage"]],
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -142,7 +142,7 @@ export class SessionStore {
       }
       session.layout_warnings = warnings;
       const userMessages = acceptedPrompts
-        .filter((prompt) => prompt.tag === "message" && prompt.prompt)
+        .filter((prompt) => prompt.prompt)
         .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
       session.prompts = [...(session.prompts || []), ...acceptedPrompts];
       session.chat = [...(session.chat || []), ...userMessages];

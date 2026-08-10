@@ -23,8 +23,7 @@ async function createChromeHarness({
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
   if (initialQueued.length) storage.set("lavish-axi:queued:abc", JSON.stringify(initialQueued));
-  if (initialPendingSubmission)
-    storage.set("lavish-axi:submission:abc", JSON.stringify(initialPendingSubmission));
+  if (initialPendingSubmission) storage.set("lavish-axi:submission:abc", JSON.stringify(initialPendingSubmission));
   const postedToFrame = [];
   const postedToWhiteboard = [];
   const inlineWhiteboards = [];
@@ -1592,6 +1591,25 @@ test("chrome client strips the internal queue key before posting prompts", async
     domSnapshot: "uid=1 body",
   });
   assert.equal(chrome.queued().length, 0);
+});
+
+test("sent annotations remain visible in the conversation after their queue pills clear", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true }),
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Make the heading shorter", selector: "h1", tag: "annotation", text: "Heading" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 h1" });
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  const bubble = chrome.element("chatLog").lastAppendedChild;
+  assert.ok(bubble, "the sent annotation should become a conversation bubble");
+  assert.match(bubble.innerHTML, /Make the heading shorter/);
 });
 
 test("chrome shows queued, sent, delivered, and acknowledged feedback states", async () => {

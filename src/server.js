@@ -754,6 +754,8 @@ export async function serve({
       const sendLayoutWarnings = (key, warnings) => {
         if (key === req.params.key) {
           res.write(`event: layout-warnings\ndata: ${JSON.stringify({ warnings })}\n\n`);
+        }
+      };
       const sendFeedbackDelivered = (key, feedbackId) => {
         if (key === req.params.key) {
           res.write(`event: feedback-delivered\ndata: ${JSON.stringify({ feedback_id: feedbackId })}\n\n`);
