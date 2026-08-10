@@ -688,7 +688,7 @@ test("send and end submits queued prompts before ending the session", async () =
 
   assert.match(js, /let endAfterSubmit = false/);
   assert.match(js, /sendQueued\(true\)/);
-  assert.match(js, /if \(shouldEndSession\) body\.endSession = true/);
+  assert.match(js, /if \(endAfterSubmit\) body\.endSession = true/);
   assert.match(js, /if \(shouldEndSession\) \{\n {4}endAfterSubmit = false;\n {4}markSessionEnded\(\)/);
   assert.match(js, /if \(!succeeded\) \{\n {6}endAfterSubmit = false/);
   assert.doesNotMatch(js, /await endSession\(\)/);
@@ -2934,6 +2934,18 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
       assert.equal(feedback.session_ended, true);
       assert.equal(feedback.ended_by, "user");
       assert.equal(feedback.prompts.length, 1);
+      assert.match(feedback.feedback_id, /^[0-9a-f-]{36}$/);
+
+      const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+      });
+      assert.equal(acknowledged.status, 200);
+      assert.deepEqual(await acknowledged.json(), {
+        status: "acknowledged",
+        feedback_id: feedback.feedback_id,
+      });
 
       const ended = await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`);
       const endedBody = await ended.json();
@@ -3011,10 +3023,18 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
     });
-    await pollPromise;
+    const feedback = await pollPromise;
 
+    const waiting = await waitForPresence();
+    assert.equal(waiting, "waiting", "delivery alone should not imply the agent is processing feedback");
+    const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+    });
+    assert.equal(acknowledged.status, 200);
     const working = await waitForPresence();
-    assert.equal(working, "working", "should switch to working when poll releases after at least one attach");
+    assert.equal(working, "working", "should switch to working only after the agent acknowledges processing");
 
     presenceController.abort();
     await presenceFetch.catch(() => {});
@@ -3176,7 +3196,7 @@ test("heartbeat long-poll errors close the stream without Express error handling
   assert.match(source, /respond\(\)\.catch\(handleRespondError\)/);
 });
 
-test("SSE agent-presence switches to working when poll immediately takes queued feedback", async () => {
+test("SSE agent-presence switches to working after acknowledging immediately delivered feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3238,8 +3258,13 @@ test("SSE agent-presence switches to working when poll immediately takes queued 
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
     });
-    await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
-
+    const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
+    const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+    });
+    assert.equal(acknowledged.status, 200);
     const working = await waitForPresence();
     assert.equal(working, "working");
 
@@ -3273,7 +3298,13 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
+      const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+      });
+      assert.equal(acknowledged.status, 200);
       assert.equal(await presence.next(), "working");
 
       await fetch(`${base}/api/${key}/end`, { method: "POST" });
@@ -3321,8 +3352,14 @@ test("SSE agent-presence returns to waiting after an agent reply", async () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      // A poll that drains the feedback and releases leaves presence "working".
-      await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+      // A poll that drains the feedback and releases leaves presence "waiting" until the
+      // agent acknowledges the batch; the acknowledgement is what marks it "working".
+      const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
+      await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+      });
       assert.equal(await presence.next(), "working");
 
       // The reply concludes that work. Without a clear here, presence stays "working"
@@ -3361,7 +3398,13 @@ test("SSE agent-presence stays working when resuming an open session", async () 
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
     });
-    await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`);
+    const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
+    const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ feedback_id: feedback.feedback_id }),
+    });
+    assert.equal(acknowledged.status, 200);
 
     await fetch(`${base}/api/sessions`, {
       method: "POST",

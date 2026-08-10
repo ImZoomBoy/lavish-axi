@@ -88,7 +88,7 @@ ${home.help[home.help.length - 1]}
    Cosmetic, intentional, transient, tiny, and uncertain observations remain silent.
 ${POLL_WAKE_PATH_RULES.map((rule) => `   ${skillCommandText(rule)}`).join("\n")}
 4. If poll returns feedback, apply the user's prompts. A \`layout-warnings\` prompt is an explicit repair request; apply every listed fix in one pass before saving, and let Lavish re-check it after a newer artifact load.
-5. Apply human feedback, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
+5. Apply human feedback. When poll returns a feedback batch with a \`feedback_id\`, run \`npx -y lavish-axi ack <html-file> <feedback_id>\` after processing it, then poll again with \`--agent-reply "<message>"\` to reply in the browser and keep the loop going under the same foreground-or-verified-wake-path rule.
 6. Run \`npx -y lavish-axi end <html-file>\` when the review is finished.
 7. ${POLL_SEND_AND_END_RULE} Deliver any remaining updates directly in this conversation.
 

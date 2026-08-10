@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 
@@ -65,6 +66,8 @@ export class SessionStore {
         url,
         status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
         pending_prompts: existing.pending_prompts || 0,
+        inflight_feedback: existing.inflight_feedback || null,
+        accepted_submission_ids: existing.accepted_submission_ids || [],
         prompts: existingPrompts,
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
         // must never silently drop unresolved warnings the user has not triaged yet.
@@ -87,6 +90,11 @@ export class SessionStore {
       const session = state.sessions[key];
       if (!session) {
         return null;
+      }
+      const submissionId = normalizeSubmissionId(payload);
+      const acceptedSubmissionIds = session.accepted_submission_ids || [];
+      if (submissionId && acceptedSubmissionIds.includes(submissionId)) {
+        return session;
       }
       const prompts = Array.isArray(payload.prompts) ? payload.prompts : [];
       const shouldEndSession = Boolean(payload.endSession || payload.end_session);
@@ -134,7 +142,7 @@ export class SessionStore {
       }
       session.layout_warnings = warnings;
       const userMessages = acceptedPrompts
-        .filter((prompt) => prompt.tag === "message" && prompt.prompt)
+        .filter((prompt) => prompt.prompt)
         .map((prompt) => ({ role: "user", text: prompt.prompt, at: new Date().toISOString() }));
       session.prompts = [...(session.prompts || []), ...acceptedPrompts];
       session.chat = [...(session.chat || []), ...userMessages];
@@ -142,6 +150,9 @@ export class SessionStore {
       session.dom_snapshot = String(payload.domSnapshot || payload.dom_snapshot || "");
       session.status = shouldEndSession || alreadyEnded ? "ended" : session.prompts.length > 0 ? "feedback" : "open";
       if (shouldEndSession) session.ended_by = "user";
+      if (submissionId) {
+        session.accepted_submission_ids = [...acceptedSubmissionIds, submissionId].slice(-200);
+      }
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
       return session;
@@ -427,8 +438,15 @@ export class SessionStore {
       if (!session) {
         return { status: "missing" };
       }
+      // Keep a delivered batch durable until the agent acknowledges it after processing. If a
+      // poll response is interrupted, the next poll receives the same batch instead of silently
+      // losing the user's feedback.
+      if (session.inflight_feedback) {
+        return feedbackDeliveryResult(session.inflight_feedback);
+      }
       // Prompts queued before the session ended (a browser send-and-end) must still reach the
-      // agent, so deliver them before reporting the ended state; the next poll then sees ended.
+      // agent, so deliver them before reporting the ended state; the next acknowledged poll then
+      // sees ended.
       const prompts = session.prompts || [];
       // Layout warnings are NOT delivered here. Detection is passive: the user decides which
       // warnings become work by queueing them, and that arrives as an ordinary prompt above.
@@ -439,8 +457,8 @@ export class SessionStore {
       if (prompts.length === 0 && artifactFailures.length === 0) {
         return alreadyEnded ? { status: "ended", ended_by: session.ended_by } : { status: "waiting" };
       }
-      const result = {
-        status: "feedback",
+      const delivery = {
+        feedback_id: randomUUID(),
         dom_snapshot: session.dom_snapshot || "",
         prompts,
         ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
@@ -448,6 +466,7 @@ export class SessionStore {
         // knows not to expect (or force) a reopened browser afterward.
         ...(alreadyEnded ? { session_ended: true, ended_by: session.ended_by } : {}),
       };
+      session.inflight_feedback = delivery;
       session.prompts = [];
       session.artifact_failures = [];
       session.pending_prompts = 0;
@@ -457,7 +476,33 @@ export class SessionStore {
       }
       session.updated_at = new Date().toISOString();
       await this.writeState(state);
-      return result;
+      return feedbackDeliveryResult(delivery);
+    });
+  }
+
+  async acknowledgeFeedback(key, feedbackId) {
+    return this.runExclusive(async () => {
+      const state = await this.readState();
+      const session = state.sessions[key];
+      if (!session) return null;
+
+      const normalizedFeedbackId = String(feedbackId || "");
+      const delivery = session.inflight_feedback;
+      if (!delivery) {
+        return { status: "already-acknowledged", feedback_id: normalizedFeedbackId };
+      }
+      if (delivery.feedback_id !== normalizedFeedbackId) {
+        return { status: "mismatch", feedback_id: delivery.feedback_id };
+      }
+
+      session.inflight_feedback = null;
+      if (session.status !== "ended") {
+        session.status =
+          (session.prompts || []).length > 0 || (session.artifact_failures || []).length > 0 ? "feedback" : "open";
+      }
+      session.updated_at = new Date().toISOString();
+      await this.writeState(state);
+      return { status: "acknowledged", feedback_id: normalizedFeedbackId };
     });
   }
 
@@ -525,6 +570,23 @@ export class SessionStore {
   async writeState(state) {
     await writeFile(this.file, `${JSON.stringify(state, null, 2)}\n`);
   }
+}
+
+function normalizeSubmissionId(payload) {
+  const value = payload?.submission_id || payload?.submissionId;
+  const normalized = String(value || "").trim();
+  return normalized || null;
+}
+
+function feedbackDeliveryResult(delivery) {
+  return {
+    status: "feedback",
+    feedback_id: String(delivery.feedback_id || ""),
+    dom_snapshot: delivery.dom_snapshot || "",
+    prompts: delivery.prompts || [],
+    ...(delivery.artifact_failures?.length > 0 ? { artifact_failures: delivery.artifact_failures } : {}),
+    ...(delivery.session_ended ? { session_ended: true, ended_by: delivery.ended_by } : {}),
+  };
 }
 
 export async function canonicalFile(file) {

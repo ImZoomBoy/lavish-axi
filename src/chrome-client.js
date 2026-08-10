@@ -8,6 +8,7 @@ const queueStorageKey = "lavish-axi:queued:" + key;
 // Review-chrome state that must survive a browser refresh. Keyed per session so one review's
 // triage can never leak into another artifact's.
 const warningSelectionStorageKey = "lavish-axi:warning-selection:" + key;
+const submissionStorageKey = "lavish-axi:submission:" + key;
 const internalQueueKeyField = "_lavishQueueKey";
 const initialChat = Array.isArray(sessionData.initialChat) ? sessionData.initialChat : [];
 const MODE_TOGGLE_HOTKEY_KEY = String(sessionData.modeToggleHotkeyKey || "").toLowerCase();
@@ -66,6 +67,7 @@ const warningsSelected = /** @type {HTMLSpanElement} */ (document.getElementById
 const warningsList = /** @type {HTMLDivElement} */ (document.getElementById("warningsList"));
 const warningsQueueButton = /** @type {HTMLButtonElement} */ (document.getElementById("warningsQueueButton"));
 const sendHint = /** @type {HTMLDivElement} */ (document.getElementById("sendHint"));
+const feedbackStatusElement = /** @type {HTMLDivElement} */ (document.getElementById("feedbackStatus"));
 const whiteboardOverlay = /** @type {HTMLDivElement} */ (document.getElementById("whiteboardOverlay"));
 const whiteboardFrame = /** @type {HTMLIFrameElement} */ (document.getElementById("whiteboardFrame"));
 const whiteboardCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("whiteboardClose"));
@@ -73,6 +75,7 @@ const whiteboardError = /** @type {HTMLDivElement} */ (document.getElementById("
 const artifactSrc = frame.dataset.artifactSrc || frame.getAttribute?.("data-artifact-src") || frame.src || "";
 
 const queued = loadQueuedPrompts();
+let pendingSubmission = loadPendingSubmission();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
@@ -99,6 +102,8 @@ let endAfterSubmit = false;
 let workingBubble = null;
 let submitQueuedPromise = null;
 let submitQueuedAgain = false;
+let feedbackDeliveryStatus = "idle";
+let feedbackDeliveryId = "";
 let lastScroll = { x: 0, y: 0 };
 // In-iframe review context (an open annotation card's unsent text, Lavish-owned question
 // answers). The sandbox means the chrome cannot read it back after a reload, so the SDK reports
@@ -185,7 +190,40 @@ function persistQueuedPrompts() {
   }
 }
 
+function loadPendingSubmission() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(submissionStorageKey) || "null");
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      typeof parsed.submission_id !== "string" ||
+      !parsed.submission_id ||
+      !Array.isArray(parsed.prompts) ||
+      !parsed.body ||
+      typeof parsed.body !== "object"
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function persistPendingSubmission() {
+  try {
+    if (pendingSubmission) {
+      sessionStorage.setItem(submissionStorageKey, JSON.stringify(pendingSubmission));
+    } else {
+      sessionStorage.removeItem(submissionStorageKey);
+    }
+  } catch {
+    // The in-memory submission still protects retries if browser storage is unavailable.
+  }
+}
+
 function render() {
+  if (queued.length && feedbackDeliveryStatus === "idle") setFeedbackStatus("queued");
   annotationPills.innerHTML = queued
     .map(
       (prompt, index) =>
@@ -346,6 +384,7 @@ function scrollElementIntoView(el) {
 function removeQueuedPrompt(index, event) {
   if (event) event.stopPropagation();
   queued.splice(index, 1);
+  if (queued.length === 0 && feedbackDeliveryStatus === "queued") setFeedbackStatus("idle");
   persistQueuedPrompts();
   render();
 }
@@ -369,6 +408,7 @@ function enqueuePrompt(prompt) {
     queued.push(prompt);
   }
 
+  setFeedbackStatus("queued");
   persistQueuedPrompts();
   render();
 }
@@ -396,6 +436,7 @@ function sendQueued(endAfter) {
   const text = chatInput.value.trim();
   if (text) {
     queued.push({ uid: "", prompt: text, selector: "", tag: "message", text: "Freeform message" });
+    setFeedbackStatus("queued");
     persistQueuedPrompts();
     addChat("user", text);
     chatInput.value = "";
@@ -441,10 +482,24 @@ async function submitQueued() {
 }
 
 async function submitQueuedOnce() {
-  const prompts = queued.slice();
-  const shouldEndSession = endAfterSubmit;
-  const body = { prompts: prompts.map(stripInternalPromptFields), domSnapshot: pendingSnapshot };
-  if (shouldEndSession) body.endSession = true;
+  const submission =
+    pendingSubmission ||
+    (() => {
+      const prompts = queued.slice();
+      const submissionId = createSubmissionId();
+      const body = {
+        submission_id: submissionId,
+        prompts: prompts.map(stripInternalPromptFields),
+        domSnapshot: pendingSnapshot,
+      };
+      if (endAfterSubmit) body.endSession = true;
+      const created = { submission_id: submissionId, prompts, body };
+      pendingSubmission = created;
+      persistPendingSubmission();
+      return created;
+    })();
+  const { prompts, body } = submission;
+  const shouldEndSession = Boolean(body.endSession);
   const response = await fetch("/api/" + key + "/prompts", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -459,11 +514,15 @@ async function submitQueuedOnce() {
     }
     throw new Error("failed to submit queued prompts");
   }
+  pendingSubmission = null;
+  persistPendingSubmission();
   for (const prompt of prompts) {
+    if (prompt.tag !== "message") addChat("user", prompt.prompt);
     const index = queued.indexOf(prompt);
     if (index !== -1) queued.splice(index, 1);
   }
   persistQueuedPrompts();
+  setFeedbackStatus("sent");
   render();
   if (shouldEndSession) {
     endAfterSubmit = false;
@@ -477,6 +536,24 @@ function normalizeLayoutFindings(value) {
   return Array.isArray(value)
     ? value.filter((item) => item && typeof item === "object" && String(item.severity || "").toLowerCase() === "error")
     : [];
+}
+
+function setFeedbackStatus(status, feedbackId = "") {
+  feedbackDeliveryStatus = status;
+  if (status === "queued" || status === "sent" || status === "idle") feedbackDeliveryId = "";
+  if (feedbackId) feedbackDeliveryId = String(feedbackId);
+  if (!feedbackStatusElement) return;
+
+  const copy = {
+    idle: "",
+    queued: "Queued locally. Press Send to Agent when ready.",
+    sent: "Sent to Lavish. Waiting for the agent to receive it.",
+    delivered: "Delivered to the agent. The agent is working on it.",
+    acknowledged: "The agent acknowledged this feedback.",
+  }[status];
+  feedbackStatusElement.textContent = copy || "";
+  feedbackStatusElement.hidden = !copy;
+  feedbackStatusElement.dataset.state = status;
 }
 
 function clearLayoutGateTimer() {
@@ -1006,6 +1083,11 @@ async function exportArtifact() {
   } finally {
     exportArtifactButton.disabled = false;
   }
+}
+
+function createSubmissionId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `lavish-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function openShareDialog() {
@@ -1849,6 +1931,14 @@ events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse
 events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
 // A reconnecting stream means this chrome may have missed updates while it was away.
 events.addEventListener("open", () => refreshLayoutWarnings());
+events.addEventListener("feedback-delivered", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  setFeedbackStatus("delivered", feedbackId);
+});
+events.addEventListener("feedback-acknowledged", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  if (!feedbackDeliveryId || feedbackDeliveryId === String(feedbackId)) setFeedbackStatus("acknowledged", feedbackId);
+});
 
 render();
 setWarningsDrawerOpen(false);

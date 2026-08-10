@@ -18,8 +18,12 @@ async function createChromeHarness({
   storage = new Map(),
   beginLoadResponses = [],
   handoffResponses = [],
+  initialQueued = [],
+  initialPendingSubmission = null,
 } = {}) {
   const source = await readFile(sourceUrl, "utf8");
+  if (initialQueued.length) storage.set("lavish-axi:queued:abc", JSON.stringify(initialQueued));
+  if (initialPendingSubmission) storage.set("lavish-axi:submission:abc", JSON.stringify(initialPendingSubmission));
   const postedToFrame = [];
   const postedToWhiteboard = [];
   const inlineWhiteboards = [];
@@ -494,6 +498,16 @@ test("stale re-handshake responses cannot overwrite a newer load", async () => {
   assert.match(lastRequest.init.body, /new-handoff/);
   assert.doesNotMatch(lastRequest.init.body, /old-recovery/);
   assert.equal(chrome.element("handoffBanner").hidden, true);
+});
+
+test("chrome restores the queued feedback status after reload", async () => {
+  const chrome = await createChromeHarness({
+    initialQueued: [{ prompt: "Review the title", selector: "h1", tag: "annotation", text: "Title" }],
+  });
+
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "queued");
+  assert.equal(chrome.element("feedbackStatus").hidden, false);
+  assert.match(chrome.element("feedbackStatus").textContent, /Queued locally/);
 });
 
 test("chrome client replaces queued prompts with the same internal key", async () => {
@@ -1570,11 +1584,60 @@ test("chrome client strips the internal queue key before posting prompts", async
 
   assert.equal(posts.length, 1);
   assert.equal(posts[0].url, "/api/abc/prompts");
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Use plan B", selector: "input#plan-b", tag: "choice", text: "Plan B" }],
     domSnapshot: "uid=1 body",
   });
   assert.equal(chrome.queued().length, 0);
+});
+
+test("sent annotations remain visible in the conversation after their queue pills clear", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true }),
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Make the heading shorter", selector: "h1", tag: "annotation", text: "Heading" },
+  });
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 h1" });
+  await flushPromises();
+
+  assert.equal(chrome.queued().length, 0);
+  const bubble = chrome.element("chatLog").lastAppendedChild;
+  assert.ok(bubble, "the sent annotation should become a conversation bubble");
+  assert.match(bubble.innerHTML, /Make the heading shorter/);
+});
+
+test("chrome shows queued, sent, delivered, and acknowledged feedback states", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ status: "queued" }) }),
+  });
+
+  chrome.sendFrameMessage({
+    type: "lavish:queuePrompt",
+    prompt: { prompt: "Review the title", selector: "h1", tag: "annotation", text: "Title" },
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "queued");
+
+  chrome.element("send").onclick();
+  chrome.sendFrameMessage({ type: "lavish:snapshot", snapshot: "uid=1 h1" });
+  await flushPromises();
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "sent");
+  assert.match(chrome.element("feedbackStatus").textContent, /Sent to Lavish/);
+
+  chrome.eventSource().listeners.get("feedback-delivered")({
+    data: JSON.stringify({ feedback_id: "feedback-1" }),
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "delivered");
+
+  chrome.eventSource().listeners.get("feedback-acknowledged")({
+    data: JSON.stringify({ feedback_id: "feedback-1" }),
+  });
+  assert.equal(chrome.element("feedbackStatus").dataset.state, "acknowledged");
 });
 
 test("chrome send and end carries the end intent with queued prompts", async () => {
@@ -1601,7 +1664,9 @@ test("chrome send and end carries the end intent with queued prompts", async () 
     posts.map((post) => post.url),
     ["/api/abc/prompts"],
   );
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
     endSession: true,
@@ -1666,7 +1731,9 @@ test("chrome send and end during an in-flight submit still ends after the submit
     posts.map((post) => post.url),
     ["/api/abc/prompts", "/api/abc/end"],
   );
-  assert.deepEqual(posts[0].body, {
+  const { submission_id: submissionId, ...submissionBody } = posts[0].body;
+  assert.match(submissionId, /^lavish-/);
+  assert.deepEqual(submissionBody, {
     prompts: [{ prompt: "Ship this", selector: "button#ship", tag: "choice", text: "Ship" }],
     domSnapshot: "uid=1 body",
   });

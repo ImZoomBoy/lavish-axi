@@ -1137,24 +1137,26 @@ test("share help distinguishes public default from password-protected shares", (
 test("feedback next step keeps the next poll completion observable", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
-    response: { status: "feedback", dom_snapshot: "", prompts: [] },
+    response: { status: "feedback", feedback_id: "feedback-1", dom_snapshot: "", prompts: [] },
   });
 
   assert.equal("artifact_failures" in output, false);
   assert.equal("layout_warnings" in output, false);
+  assert.equal(output.session.feedback_id, "feedback-1");
+  assert.match(output.next_step, /lavish-axi ack \/tmp\/report\.html feedback-1/);
   assert.match(output.next_step, /never kill it/);
   assert.match(output.next_step, /without --timeout-ms/);
   assertObservablePollWakePath(output.next_step);
   assert.doesNotMatch(output.next_step, /Codex/);
   assert.match(output.next_step, /queued feedback is never lost/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
+  assert.match(output.next_step, /Do not respond to the user just yet\. First run/);
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
 });
 
 test("feedback next step is Codex-aware when requested", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
-    response: { status: "feedback", dom_snapshot: "", prompts: [] },
+    response: { status: "feedback", feedback_id: "feedback-1", dom_snapshot: "", prompts: [] },
     agent: "codex",
   });
 
@@ -1499,6 +1501,73 @@ test("spawned poll with piped stderr banners once and leaves re-run guidance whe
       assert.match(stderr, /Poll interrupted/);
       assert.match(stderr, /queued feedback is never lost/);
     }
+  } finally {
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true });
+  }
+});
+
+test("spawned poll delivers a feedback batch and the ack command confirms processing", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-ack-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  const server = await serve({ port: 0, stateFile: `${stateDir}/state.json`, version: VERSION });
+  try {
+    const sessionResponse = await fetch(`http://127.0.0.1:${server.port}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await sessionResponse.json();
+    await fetch(`http://127.0.0.1:${server.port}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "Make it warmer", selector: "body", tag: "body", text: "hello" }] }),
+    });
+
+    const child = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "poll", artifact],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
+      },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    const result = await new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code, signal) => resolve({ code, signal }));
+    });
+
+    assert.equal(result.code, 0);
+    assert.match(stdout, /delivered/);
+    const state = JSON.parse(await readFile(`${stateDir}/state.json`, "utf8"));
+    const feedbackId = state.sessions[key].inflight_feedback.feedback_id;
+    const ackChild = spawn(
+      process.execPath,
+      [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), "ack", artifact, feedbackId],
+      {
+        cwd: fileURLToPath(new URL("..", import.meta.url)),
+        env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
+      },
+    );
+    let ackStdout = "";
+    ackChild.stdout.on("data", (chunk) => {
+      ackStdout += chunk.toString();
+    });
+    const ackResult = await new Promise((resolve, reject) => {
+      ackChild.on("error", reject);
+      ackChild.on("close", (code, signal) => resolve({ code, signal }));
+    });
+    assert.equal(ackResult.code, 0);
+    assert.match(ackStdout, /acknowledged/);
+    const retry = await fetch(
+      `http://127.0.0.1:${server.port}/api/poll?file=${encodeURIComponent(artifact)}&timeoutMs=0`,
+    );
+    assert.deepEqual(await retry.json(), { status: "waiting" });
   } finally {
     await server.close();
     await rm(stateDir, { force: true, recursive: true });

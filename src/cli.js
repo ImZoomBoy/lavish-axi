@@ -32,7 +32,19 @@ import { resolveDesignAssetPath, serve } from "./server.js";
 import { canonicalFile, sessionKey, SessionStore } from "./session-store.js";
 import { initDefaultTelemetry } from "./telemetry.js";
 
-const COMMANDS = new Set(["open", "poll", "end", "stop", "server", "playbook", "design", "setup", "export", "share"]);
+const COMMANDS = new Set([
+  "open",
+  "poll",
+  "ack",
+  "end",
+  "stop",
+  "server",
+  "playbook",
+  "design",
+  "setup",
+  "export",
+  "share",
+]);
 // SDK-reserved built-ins (e.g. `update`) must reach runAxiCli untouched; otherwise
 // the bare-arg normalization below would rewrite them into the hidden `open` command.
 const RESERVED = new Set(RESERVED_COMMANDS);
@@ -51,6 +63,8 @@ export const POLL_SEND_AND_END_RULE =
   "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
 const CODEX_POLL_WAKE_PATH_GUIDANCE =
   "Codex detected: completed background tasks may not resume Codex automatically, so keep the poll attached to the active turn.";
+const FEEDBACK_RECEIPT_GUIDANCE =
+  'The poll output includes `receipt.status: "delivered"` and a `feedback_id`; after reading and applying the batch, run `lavish-axi ack <html-file> <feedback_id>` so Lavish knows the agent processed it.';
 // Inlined at build time from package.json; falls back to reading package.json so source-run tests work.
 export const VERSION =
   process.env.LAVISH_AXI_BUILD_VERSION ||
@@ -112,6 +126,7 @@ export async function run(argv) {
       commands: {
         open: openCommand,
         poll: pollCommand,
+        ack: ackCommand,
         end: endCommand,
         stop: stopCommand,
         playbook: playbookCommand,
@@ -187,7 +202,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true, agent 
       "Run `lavish-axi <html-file>` to open or resume a Lavish Editor session. If the user explicitly ended the session from the browser, this refuses to reopen it and explains why instead of reopening uninvited - pass `--reopen` only when the user asks for further review or something important needs their visual attention",
       "Unless the user specifies another location, create HTML artifacts in the current working directory under `.lavish/`",
       "Lavish serves the html file through a local express.js server. If your html needs to reference other filesystem assets such as images, CSS, fonts, and local scripts, copy them into the same directory as the HTML file, then reference them with relative paths from that directory. Never prepend `/` to those asset paths - root paths won't work",
-      `Run \`lavish-axi poll <html-file>\` to wait for user feedback. It long-polls and stays silent until the user sends feedback or ends the session, so leave it running - never kill it. Detected layout issues never return this poll: the browser files them in the user's Layout issues inbox in the Lavish top bar, and they arrive as an ordinary tag "layout-warnings" prompt only when the user selects them and queues the fixes. Never edit the artifact to chase a layout issue the user has not queued. The only exception is a fatal artifact_failures response, which means the review surface itself could not be used. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}`,
+      `Run \`lavish-axi poll <html-file>\` to wait for user feedback. It long-polls and stays silent until the user sends feedback or ends the session, so leave it running - never kill it. A feedback response is delivered with a feedback_id; after reading and applying it, run \`lavish-axi ack <html-file> <feedback_id>\` before polling again. Detected layout issues never return this poll: the browser files them in the user's Layout issues inbox in the Lavish top bar, and they arrive as an ordinary tag "layout-warnings" prompt only when the user selects them and queues the fixes. Never edit the artifact to chase a layout issue the user has not queued. The only exception is a fatal artifact_failures response, which means the review surface itself could not be used. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}`,
       'Rendered Mermaid diagrams in `.mermaid` containers become embedded, editable Excalidraw whiteboards in the browser (click a diagram to unlock editing; a Fullscreen action opens it over the whole viewport) - flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other types embed as an image to draw on. Scenes autosave locally; when a reload detects a changed Mermaid source, the reviewer explicitly chooses to re-convert and discard saved edits or keep editing the saved scene. Standalone and exported copies still render plain Mermaid. Queue feedback adds a prompt to the Conversation panel; when the user sends it, poll returns a tag "whiteboard" prompt carrying a bounded edit summary plus local scenePath (.excalidraw JSON) and previewPath (PNG) files - read the summary first, open the files only when needed, then apply the edits by updating the Mermaid source in the artifact (never try to write the scene back)',
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
@@ -328,7 +343,14 @@ async function pollCommand(args) {
       retries: 3,
       retryDelayMs: 500,
     });
-    return createPollOutput({ file: absolute, response, agent: detectInvokingAgent(process.env) });
+    const output = createPollOutput({ file: absolute, response, agent: detectInvokingAgent(process.env) });
+    if (response.status === "feedback" && response.feedback_id) {
+      output.receipt = {
+        status: "delivered",
+        feedback_id: response.feedback_id,
+      };
+    }
+    return output;
   } finally {
     waitReporter?.stop();
     if (!timeoutMs) {
@@ -336,6 +358,33 @@ async function pollCommand(args) {
       process.off("SIGTERM", onPollSignal);
     }
   }
+}
+
+async function ackCommand(args) {
+  const positional = positionalArgs(args, ["--feedback-id"]);
+  const file = positional[0];
+  const feedbackId = positional[1] || flagValue(args, "--feedback-id");
+  if (!file || !feedbackId) {
+    throw new AxiError("HTML file path and feedback ID are required", "VALIDATION_ERROR", [
+      "Run `lavish-axi ack <html-file> <feedback-id>` using the feedback_id returned by poll",
+    ]);
+  }
+  const absolute = await canonicalFile(file);
+  const baseUrl = await ensureServer();
+  const response = await postJson(`${baseUrl}/api/${sessionKey(absolute)}/feedback-ack`, {
+    feedback_id: feedbackId,
+  });
+  if (response.status !== "acknowledged" && response.status !== "already-acknowledged") {
+    throw new AxiError(`Lavish Editor could not acknowledge feedback: ${response.status}`, "SERVER_ERROR");
+  }
+  return {
+    session: {
+      file: absolute,
+      status: "acknowledged",
+      feedback_id: response.feedback_id || feedbackId,
+    },
+    next_step: `The feedback batch ${response.status === "already-acknowledged" ? "was already acknowledged" : "is acknowledged"}. Continue applying the requested changes, then run \`lavish-axi poll ${absolute} --agent-reply "<message for the user>"\` to show the update and wait for more feedback.`,
+  };
 }
 
 export function pollWaitBannerText(file) {
@@ -379,7 +428,8 @@ export function startPollWaitReporter({
 
 /**
  * @returns {{
- *   session: { file: string, status: string, session_ended?: boolean, ended_by?: string },
+ *   session: { file: string, status: string, feedback_id?: string, session_ended?: boolean, ended_by?: string },
+ *   receipt?: { status: string, feedback_id: string },
  *   next_step?: string,
  *   dom_snapshot?: string,
  *   prompts?: any[],
@@ -400,12 +450,21 @@ export function createPollOutput({ file, response, agent = "generic" }) {
       session: {
         file,
         status: "feedback",
+        ...(response.feedback_id ? { feedback_id: response.feedback_id } : {}),
         ...(sessionEnded ? { session_ended: true, ...(endedBy ? { ended_by: endedBy } : {}) } : {}),
       },
       dom_snapshot: response.dom_snapshot || "",
       prompts: response.prompts || [],
       ...(artifactFailures.length > 0 ? { artifact_failures: artifactFailures } : {}),
-      next_step: createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, response.prompts || [], agent),
+      next_step: createFeedbackNextStep(
+        file,
+        artifactFailures,
+        sessionEnded,
+        endedBy,
+        response.prompts || [],
+        response.feedback_id,
+        agent,
+      ),
     };
   }
   if (response.status === "ended") {
@@ -420,8 +479,20 @@ export function createPollOutput({ file, response, agent = "generic" }) {
   };
 }
 
-function createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, prompts = [], agent = "generic") {
+function createFeedbackNextStep(
+  file,
+  artifactFailures,
+  sessionEnded,
+  endedBy,
+  prompts = [],
+  feedbackId = "",
+  agent = "generic",
+) {
   const count = artifactFailures.length;
+  const receiptNote = `${FEEDBACK_RECEIPT_GUIDANCE} `;
+  const acknowledgementNote = feedbackId
+    ? `After you have read and applied this batch, run \`lavish-axi ack ${file} ${feedbackId}\` before polling again. `
+    : "After the poll returns a feedback_id, acknowledge the batch with `lavish-axi ack <html-file> <feedback_id>` after applying it. ";
   const whiteboardNote = prompts.some((prompt) => prompt && prompt.tag === "whiteboard")
     ? `This feedback includes whiteboard edits (tag "whiteboard"): read the edit summary in the prompt text first, and only when it is not enough, open the target's scenePath (.excalidraw scene JSON) or previewPath (PNG) local files for detail. The artifact's Mermaid source stays authoritative - apply the edits by updating the Mermaid text in ${file} (Lavish live-reloads it); never try to write the .excalidraw scene back. `
     : "";
@@ -440,13 +511,17 @@ function createFeedbackNextStep(file, artifactFailures, sessionEnded, endedBy, p
         count > 0
           ? ""
           : ` Only run \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
-      return `${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
+      return `${receiptNote}${acknowledgementNote}${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
     }
-    return `${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
+    return `${receiptNote}${acknowledgementNote}${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
   }
   const prefix =
     count > 0 ? artifactFailuresPrefix(file, artifactFailures) : `Apply the requested changes to ${file}. `;
-  return `${prefix}${layoutNote}${whiteboardNote}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms unless the user ended the session. The poll waits silently until the user sends more feedback or ends the session - never kill it. ${pollExecutionGuidance({ agent })}`;
+  const nextPoll = `run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms`;
+  const acknowledgementStep = feedbackId
+    ? `First run \`lavish-axi ack ${file} ${feedbackId}\` after applying this batch, then ${nextPoll}`
+    : `Acknowledge the batch with \`lavish-axi ack <html-file> <feedback_id>\` after applying it, then ${nextPoll}`;
+  return `${receiptNote}${prefix}${layoutNote}${whiteboardNote}Do not respond to the user just yet. ${acknowledgementStep} unless the user ended the session. The poll waits silently until the user sends more feedback or ends the session - never kill it. ${pollExecutionGuidance({ agent })}`;
 }
 
 // The narrow fatal path. Ordinary layout findings never reach the poll: they wait in the user's
@@ -1300,9 +1375,10 @@ function pollResponseInterruptedError() {
   ]);
 }
 
-function firstPositionalArg(args, valueFlags = []) {
+function positionalArgs(args, valueFlags = []) {
   const flags = new Set(valueFlags);
   let positionalMode = false;
+  const positional = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (!positionalMode && arg === "--") {
@@ -1316,9 +1392,13 @@ function firstPositionalArg(args, valueFlags = []) {
     if (!positionalMode && arg.startsWith("-")) {
       continue;
     }
-    return arg;
+    positional.push(arg);
   }
-  return null;
+  return positional;
+}
+
+function firstPositionalArg(args, valueFlags = []) {
+  return positionalArgs(args, valueFlags)[0] || null;
 }
 
 function flagValue(args, flag) {
@@ -1352,13 +1432,14 @@ export function getCommandHelp(command, { agent = "generic" } = {}) {
 }
 
 function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
+  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. A feedback response is delivered with a feedback_id; after reading and applying it, run \`lavish-axi ack <html-file> <feedback_id>\` before polling again. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
 }
 
 function createCommandHelp({ agent = "generic" } = {}) {
   return {
     open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
-    poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
+    poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts. A feedback response includes a receipt with status "delivered" and a feedback_id; after reading and applying the batch, run \`lavish-axi ack <html-file> <feedback-id>\` so Lavish knows the agent processed it. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
+    ack: `Usage: lavish-axi ack <html-file> <feedback-id>\n\nAcknowledge a feedback batch after the agent has read and processed it. The feedback_id comes from the preceding \`lavish-axi poll\` response. Until this command succeeds, a re-run of poll returns the same batch so interrupted agent work is safe.\n`,
     end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,
     export: `Usage: lavish-axi export <html-file> [--out <path>]\n\nWrite a portable copy of an artifact: one HTML file with its LOCAL assets inlined (relative-path stylesheets, scripts, images, and fonts become inline <style>/<script> blocks and data URIs). Remote CDN/font references (https URLs) are left as links for the browser to load, so the file needs network to render those. Lavish makes no outbound requests - it only reads local files, confined to the artifact's directory. Defaults to writing <name>.export.html next to the source; pass --out to choose a path. The Lavish annotation SDK is never included in an export.\n`,
     share: `Usage: lavish-axi share <html-file> [--password <pw>] [--token <t>]\n\nPublish the artifact on ht-ml.app (https://ht-ml.app), a third-party hosting service not part of Lavish, and print a visitable URL. Shares are PUBLIC by default: anyone with the link can open the page, and it may be indexed or scraped. Pass --password to publish a PRIVATE password-protected page; viewers must supply the password to view. Builds the same local-inlined HTML as 'export' (local assets inlined; remote CDN/font URLs left as links and are not blocked by CSP on ht-ml.app, but still load over the viewer's network), then POSTs it to ht-ml.app's /v1 API. Creating a site needs no account or API key. The response includes the url plus a secret update_key (shown once) for updating or deleting the page later. Set LAVISH_AXI_HTML_APP_TOKEN (or pass --token) to attach an optional bearer token; it is never required. The annotation SDK is never included.\n`,
