@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import chokidar from "chokidar";
 import express from "express";
+import { WebSocketServer } from "ws";
 
 import {
   classifySevereTextOverflow,
@@ -43,6 +44,7 @@ import {
 } from "./export-bundle.js";
 import { publishToHtmlApp } from "./html-app.js";
 import { injectLavishSdk } from "./html-transform.js";
+import { createLivePages, formatStreamEvent, LEGACY_STREAM_RETRY_MS } from "./live-updates.js";
 import { bindHost, extraAllowedHosts, hostForUrl, IPV6_LOOPBACK_HOST, linkHost, LOOPBACK_HOST } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 
@@ -67,6 +69,8 @@ const designAssetUrls = {
 };
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60_000;
+// A live socket that misses a ping for this long is a dead page and is dropped.
+const LIVE_SOCKET_HEARTBEAT_MS = 30_000;
 const WHITEBOARD_CHANNEL_TOKEN_TTL_MS = 5 * 60_000;
 
 // Live-reload coalescing. A normal save is one reload after a short debounce. While a queued
@@ -110,7 +114,7 @@ export function isValidWhiteboardChannelToken(token, secret, now = Date.now()) {
   return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
 }
 
-// A detached server should not live forever. When no browser chrome (SSE) and no agent poll
+// A detached server should not live forever. When no review page and no agent poll
 // are connected for this long, the server shuts itself down so it stops dangling. The next
 // `lavish-axi <file>` invocation re-spawns a fresh server and adopts resumable sessions from
 // state.json. Browser-ended sessions still require the explicit --reopen opt-in. Set
@@ -143,7 +147,7 @@ export async function serve({
   const watchers = new Map();
   const activePolls = new Map();
   const deliveredFeedback = new Set();
-  const sseClients = new Set();
+  const livePages = createLivePages(events);
   const whiteboardChannelSecret = crypto.randomBytes(32);
   // Sessions with at least one warning the user queued that has not been re-checked yet.
   const outstandingRepairBatches = new Set();
@@ -197,7 +201,7 @@ export async function serve({
   app.get("/health", (req, res) => {
     let polls = 0;
     for (const count of activePolls.values()) polls += count;
-    res.json({ ok: true, app: "lavish-axi", version, live: { polls, pages: sseClients.size } });
+    res.json({ ok: true, app: "lavish-axi", version, live: { polls, pages: livePages.count() } });
   });
 
   let shutdownResolve;
@@ -503,7 +507,7 @@ export async function serve({
       // The reply concludes the delivered-feedback "working" state. Without this, a poll that
       // drains feedback and then releases leaves presence stuck on "working" — the chrome keeps
       // Send disabled — until some future poll happens to attach, even though the agent already
-      // answered. See "SSE agent-presence returns to waiting after an agent reply".
+      // answered. See "live agent-presence returns to waiting after an agent reply".
       clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
       res.json({ status: "sent" });
     } catch (error) {
@@ -728,77 +732,81 @@ export async function serve({
     }
   });
 
+  // The first events a page needs on every (re)connect, so it converges on server state.
+  async function pageSnapshot(key) {
+    const session = await store.findByKey(key);
+    /** @type {Array<{ event: string, data: unknown }>} */
+    const snapshot = [
+      { event: "chat-sync", data: { chat: session?.chat || [] } },
+      { event: "agent-presence", data: { state: computePresence(key, activePolls, deliveredFeedback) } },
+    ];
+    if (session?.inflight_feedback?.feedback_id) {
+      snapshot.push({ event: "feedback-delivered", data: { feedback_id: session.inflight_feedback.feedback_id } });
+    }
+    return snapshot;
+  }
+
+  // Review pages built before the WebSocket channel still open this stream. Each request answers
+  // with what the page missed and ends, so an old tab never holds one of Chrome's six connections
+  // per host. See createLivePages in src/live-updates.js.
   app.get("/events/:key", async (req, res, next) => {
     try {
-      res.writeHead(200, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        connection: "keep-alive",
-      });
-      sseClients.add(res);
+      const key = req.params.key;
+      const poll = livePages.pollLegacy(key, req.get("last-event-id"));
       refreshIdleTimer();
-      const session = await store.findByKey(req.params.key);
-      const sendReload = (key) => {
-        if (key === req.params.key) {
-          res.write("event: reload\ndata: {}\n\n");
-        }
-      };
-      const sendAgentReply = (key, text) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-reply\ndata: ${JSON.stringify({ text })}\n\n`);
-        }
-      };
-      const sendPresence = (key, state) => {
-        if (key === req.params.key) {
-          res.write(`event: agent-presence\ndata: ${JSON.stringify({ state })}\n\n`);
-        }
-      };
-      // Warning-inbox state lives on the server, so every attached chrome - including one that
-      // just reconnected after a browser refresh - converges on the same list.
-      const sendLayoutWarnings = (key, warnings) => {
-        if (key === req.params.key) {
-          res.write(`event: layout-warnings\ndata: ${JSON.stringify({ warnings })}\n\n`);
-        }
-      };
-      const sendFeedbackDelivered = (key, feedbackId) => {
-        if (key === req.params.key) {
-          res.write(`event: feedback-delivered\ndata: ${JSON.stringify({ feedback_id: feedbackId })}\n\n`);
-        }
-      };
-      const sendFeedbackAcknowledged = (key, feedbackId) => {
-        if (key === req.params.key) {
-          res.write(`event: feedback-acknowledged\ndata: ${JSON.stringify({ feedback_id: feedbackId })}\n\n`);
-        }
-      };
-      res.write(`event: chat-sync\ndata: ${JSON.stringify({ chat: session?.chat || [] })}\n\n`);
-      res.write(
-        `event: agent-presence\ndata: ${JSON.stringify({ state: computePresence(req.params.key, activePolls, deliveredFeedback) })}\n\n`,
-      );
-      if (session?.inflight_feedback?.feedback_id) {
-        res.write(
-          `event: feedback-delivered\ndata: ${JSON.stringify({ feedback_id: session.inflight_feedback.feedback_id })}\n\n`,
-        );
-      }
-      events.on("reload", sendReload);
-      events.on("agent-reply", sendAgentReply);
-      events.on("agent-presence", sendPresence);
-      events.on("layout-warnings", sendLayoutWarnings);
-      events.on("feedback-delivered", sendFeedbackDelivered);
-      events.on("feedback-acknowledged", sendFeedbackAcknowledged);
-      req.on("close", () => {
-        sseClients.delete(res);
-        events.off("reload", sendReload);
-        events.off("agent-reply", sendAgentReply);
-        events.off("agent-presence", sendPresence);
-        events.off("layout-warnings", sendLayoutWarnings);
-        events.off("feedback-delivered", sendFeedbackDelivered);
-        events.off("feedback-acknowledged", sendFeedbackAcknowledged);
-        refreshIdleTimer();
-      });
+      const frames = poll.resync ? await pageSnapshot(key) : poll.events;
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      let body = `retry: ${LEGACY_STREAM_RETRY_MS}\n\n`;
+      for (const frame of frames) body += formatStreamEvent(frame.event, frame.data);
+      // Pages ignore this event type; it carries the cursor the next reconnect sends back.
+      body += formatStreamEvent("lavish-cursor", {}, poll.cursor());
+      res.end(body);
     } catch (error) {
       next(error);
     }
   });
+
+  function attachLiveSocket(key, socket) {
+    const page = {
+      send(event, data) {
+        if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ event, data }));
+      },
+      close() {
+        page.send("chrome-reload", {});
+        // 1012 is "service restart". Terminate anyway if the peer never answers the close.
+        socket.close(1012, "server restart");
+        setTimeout(() => socket.terminate(), 1000).unref();
+      },
+    };
+    // Register the page and its cleanup before any await, so a page that closes during setup is
+    // still removed. The old stream route registered cleanup after an await and leaked those.
+    const removePage = livePages.addSocket(key, page);
+    let alive = true;
+    socket.on("pong", () => {
+      alive = true;
+    });
+    const heartbeat = setInterval(() => {
+      if (!alive) {
+        socket.terminate();
+        return;
+      }
+      alive = false;
+      socket.ping();
+    }, LIVE_SOCKET_HEARTBEAT_MS);
+    heartbeat.unref();
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      clearInterval(heartbeat);
+      removePage();
+      refreshIdleTimer();
+    });
+    refreshIdleTimer();
+    pageSnapshot(key)
+      .then((snapshot) => {
+        for (const frame of snapshot) page.send(frame.event, frame.data);
+      })
+      .catch(() => socket.terminate());
+  }
 
   app.get("/chrome-client.js", async (req, res, next) => {
     try {
@@ -1021,6 +1029,27 @@ export async function serve({
   });
   publicPort = httpServer.address().port;
 
+  // Review pages take live updates over `/live/:key`. Upgrades bypass express, so the Host
+  // allowlist is applied here too. WebSockets are not bound by CORS, so a browser Origin must
+  // also match this server, or any website could read a session's chat.
+  const liveSocketServer = new WebSocketServer({ noServer: true, maxPayload: 4096 });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const match = /^\/live\/([^/?#]+)(?:\?.*)?$/.exec(req.url || "");
+    const requestHost = { host: req.headers.host, forwardedHost: req.headers["x-forwarded-host"] };
+    let refusal = "";
+    if (!match) refusal = "404 Not Found";
+    else if (shuttingDown) refusal = "503 Service Unavailable";
+    else if (!allowsAllHosts(allowedHosts) && !isAllowedRequestHost(requestHost, allowedHostnames))
+      refusal = "403 Forbidden";
+    else if (!isSameOriginUpgrade(req)) refusal = "403 Forbidden";
+    if (refusal) {
+      logEvent?.(`refused live socket ${refusal} path=${req.url ?? ""} origin=${req.headers.origin ?? ""}`);
+      socket.end(`HTTP/1.1 ${refusal}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      return;
+    }
+    liveSocketServer.handleUpgrade(req, socket, head, (ws) => attachLiveSocket(decodeURIComponent(match[1]), ws));
+  });
+
   let shuttingDown = false;
   function shutdown() {
     if (shuttingDown) return;
@@ -1029,30 +1058,28 @@ export async function serve({
       clearTimeout(idleTimer);
       idleTimer = null;
     }
-    // Tell open browser chromes to reload before we drop their SSE connection. The new
-    // server adopts the session via state.json once it binds, so the reloaded chrome
-    // immediately gets the upgraded HTML/CSS/JS.
-    for (const res of sseClients) {
+    // Tell open browser chromes to reload before we drop their live socket. The new server
+    // adopts the session via state.json once it binds, so the reloaded chrome immediately gets
+    // the upgraded HTML/CSS/JS. Polling pages from older builds just reconnect to the new server.
+    for (const page of livePages.sockets()) {
       try {
-        res.write("event: chrome-reload\ndata: {}\n\n");
-        res.end();
+        page.close();
       } catch {
         // best effort
       }
     }
-    sseClients.clear();
     for (const w of watchers.values()) {
       w.close().catch(() => {});
     }
     watchers.clear();
     httpServer.close(() => shutdownResolve());
-    // Force-close keep-alive sockets so SSE / long-polls don't keep us alive.
+    // Force-close keep-alive sockets so long-polls don't keep us alive.
     if (typeof httpServer.closeAllConnections === "function") {
       httpServer.closeAllConnections();
     }
   }
 
-  // Idle self-shutdown: the timer only runs while nothing is connected. Any live SSE chrome or
+  // Idle self-shutdown: the timer only runs while nothing is connected. Any live review page or
   // active long-poll cancels it; losing the last connection (re)arms it.
   let idleTimer = null;
   function refreshIdleTimer() {
@@ -1061,13 +1088,18 @@ export async function serve({
       idleTimer = null;
     }
     if (shuttingDown || idleTimeoutMs == null) return;
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    // Polling pages hold no connection, so they cannot re-arm the timer when they go away.
+    // The timer is armed without them and re-checks them when it fires.
+    if (livePages.socketCount() > 0 || activePolls.size > 0) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
-      if (!shuttingDown && sseClients.size === 0 && activePolls.size === 0) {
-        logEvent?.(`idle for ${idleTimeoutMs}ms with no connections, shutting down`);
-        shutdown();
+      if (shuttingDown) return;
+      if (livePages.count() > 0 || activePolls.size > 0) {
+        refreshIdleTimer();
+        return;
       }
+      logEvent?.(`idle for ${idleTimeoutMs}ms with no connections, shutting down`);
+      shutdown();
     }, idleTimeoutMs);
     idleTimer.unref?.();
   }
@@ -1078,7 +1110,7 @@ export async function serve({
   // idle timer reap it once those connections drop. Best-effort: never let a read failure
   // block the end response.
   async function shutdownIfNoLiveSessions() {
-    if (sseClients.size > 0 || activePolls.size > 0) return;
+    if (livePages.count() > 0 || activePolls.size > 0) return;
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
@@ -1243,6 +1275,23 @@ export function isAllowedRequestHost({ host, forwardedHost }, allowedHostnames) 
   const forwarded = forwardedHost === undefined || forwardedHost === null ? "" : String(forwardedHost).trim();
   if (forwarded === "") return true;
   return isAllowedHostHeader(forwarded.split(",").pop(), allowedHostnames);
+}
+
+// A browser always sends Origin on a WebSocket handshake. It must name this server, so a page on
+// another site (or the sandboxed artifact, whose origin is "null") cannot open a session's live
+// channel. A client with no Origin is not a browser and could read the same data over HTTP.
+function isSameOriginUpgrade(req) {
+  const origin = req.headers.origin;
+  if (origin === undefined) return true;
+  let originHost;
+  try {
+    originHost = new URL(String(origin)).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  const forwarded = String(req.headers["x-forwarded-host"] || "").trim();
+  const requestHost = (forwarded ? forwarded.split(",").pop() : req.headers.host) || "";
+  return originHost !== "" && originHost === String(requestHost).trim().toLowerCase();
 }
 
 // Guard state-changing, outward-facing routes (publishing to a third-party host) against CSRF: a

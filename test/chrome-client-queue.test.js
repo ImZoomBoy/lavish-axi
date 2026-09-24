@@ -28,6 +28,7 @@ async function createChromeHarness({
   const postedToWhiteboard = [];
   const inlineWhiteboards = [];
   const eventSources = [];
+  const liveSockets = [];
   const windowListeners = new Map();
   const documentListeners = new Map();
   const elements = new Map();
@@ -241,6 +242,8 @@ async function createChromeHarness({
     console,
     fetch: harnessFetch,
     location: {
+      protocol: "http:",
+      host: "127.0.0.1:4531",
       reload() {
         reloadCount += 1;
       },
@@ -252,6 +255,24 @@ async function createChromeHarness({
         return "blob:lavish-test";
       },
       revokeObjectURL() {},
+    },
+    WebSocket: class FakeWebSocket {
+      constructor(url) {
+        this.url = url;
+        this.listeners = new Map();
+        liveSockets.push(this);
+      }
+
+      addEventListener(type, handler) {
+        if (!this.listeners.has(type)) this.listeners.set(type, []);
+        this.listeners.get(type).push(handler);
+      }
+
+      dispatch(type, event = {}) {
+        let result;
+        for (const handler of this.listeners.get(type) || []) result = handler(event);
+        return result;
+      }
     },
     EventSource: class FakeEventSource {
       constructor(url) {
@@ -328,9 +349,15 @@ async function createChromeHarness({
       inlineWhiteboards.push(whiteboard);
       return whiteboard;
     },
-    eventSource() {
-      assert.equal(eventSources.length, 1);
-      return eventSources[0];
+    eventSources,
+    liveSockets,
+    /** Delivers a live event the way the server's WebSocket does, to the newest socket. */
+    liveListener(type) {
+      return (event) => {
+        assert.ok(liveSockets.length > 0, "chrome-client opened a live socket");
+        const data = event ? JSON.parse(event.data) : {};
+        return liveSockets[liveSockets.length - 1].dispatch("message", { data: JSON.stringify({ event: type, data }) });
+      };
     },
     sendFrameMessage(data) {
       const handlers = windowListeners.get("message") || [];
@@ -476,7 +503,7 @@ test("stale re-handshake responses cannot overwrite a newer load", async () => {
   });
 
   await flushPromises();
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   await flushPromises();
 
@@ -546,7 +573,7 @@ test("chrome client scrolls new chat bubbles into view above queued prompts", as
   assert.equal(panelScroll.scrollTop, 1800);
 
   panelScroll.scrollTop = 640;
-  chrome.eventSource().listeners.get("agent-reply")({
+  chrome.liveListener("agent-reply")({
     data: JSON.stringify({ text: "I updated the title." }),
   });
 
@@ -666,7 +693,7 @@ test("the warning button hides at zero and shows a deduplicated unresolved count
 
   assert.equal(chrome.element("warningsWrap").hidden, true, "no button without unresolved work");
 
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload(), warningPayload({ id: "w2", selector: "p" })] }),
   });
 
@@ -676,7 +703,7 @@ test("the warning button hides at zero and shows a deduplicated unresolved count
   assert.equal(chrome.warningRows().length, 2);
 
   // The same warnings arriving again must not inflate anything.
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload(), warningPayload({ id: "w2", selector: "p" })] }),
   });
   assert.equal(chrome.element("warningsCount").textContent, "2");
@@ -685,7 +712,7 @@ test("the warning button hides at zero and shows a deduplicated unresolved count
 
 test("resolved warnings drop out of the active count and hide the button", async () => {
   const chrome = await createChromeHarness();
-  const source = chrome.eventSource().listeners.get("layout-warnings");
+  const source = chrome.liveListener("layout-warnings");
 
   source({ data: JSON.stringify({ warnings: [warningPayload()] }) });
   assert.equal(chrome.element("warningsWrap").hidden, false);
@@ -699,7 +726,7 @@ test("resolved warnings drop out of the active count and hide the button", async
 
 test("nothing is selected by default and Select all is an explicit action", async () => {
   const chrome = await createChromeHarness();
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload(), warningPayload({ id: "w2" })] }),
   });
 
@@ -740,7 +767,7 @@ test("queueing a selected subset produces exactly one ordinary prompt with only 
       };
     },
   });
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload(), warningPayload({ id: "w2", selector: "p" })] }),
   });
 
@@ -798,7 +825,7 @@ test("a stale queued layout prompt remains available for user re-decision", asyn
       return { ok: true, json: async () => ({}) };
     },
   });
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload()] }),
   });
 
@@ -822,7 +849,7 @@ test("dismissing a warning asks the server and never clears it locally on failur
       return { ok: false, json: async () => ({}) };
     },
   });
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload()] }),
   });
 
@@ -837,7 +864,7 @@ test("dismissing a warning asks the server and never clears it locally on failur
 
 test("Reveal asks the artifact iframe to highlight the affected element", async () => {
   const chrome = await createChromeHarness();
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload({ selector: "p#copy" })] }),
   });
 
@@ -852,7 +879,7 @@ test("Reveal asks the artifact iframe to highlight the affected element", async 
 
 test("the drawer manages focus and closes on Escape", async () => {
   const chrome = await createChromeHarness();
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload()] }),
   });
 
@@ -870,7 +897,7 @@ test("the drawer manages focus and closes on Escape", async () => {
 
 test("a click outside the drawer closes it", async () => {
   const chrome = await createChromeHarness();
-  chrome.eventSource().listeners.get("layout-warnings")({
+  chrome.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload()] }),
   });
   chrome.element("warningsButton").click();
@@ -882,7 +909,7 @@ test("a click outside the drawer closes it", async () => {
 
 test("warning state and selection survive a chrome reload of the same session", async () => {
   const first = await createChromeHarness();
-  first.eventSource().listeners.get("layout-warnings")({
+  first.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload(), warningPayload({ id: "w2" })] }),
   });
   const [row] = first.warningRows();
@@ -907,7 +934,7 @@ test("warning state and selection survive a chrome reload of the same session", 
 
 test("warning state does not leak across review sessions", async () => {
   const first = await createChromeHarness();
-  first.eventSource().listeners.get("layout-warnings")({
+  first.liveListener("layout-warnings")({
     data: JSON.stringify({ warnings: [warningPayload()] }),
   });
   const [row] = first.warningRows();
@@ -1176,7 +1203,7 @@ test("layout gate re-arms on reload and still reveals on the next completed pass
   chrome.runTimers(25);
   assert.equal(chrome.element("layoutGateOverlay").hidden, true);
 
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   assert.equal(chrome.element("layoutGateOverlay").hidden, false);
   assert.equal(chrome.element("body").classList.contains("layout-gate-active"), true);
 
@@ -1207,7 +1234,7 @@ test("a stale prior-document diagnostic cannot reveal the new gate or clear its 
 
   const oldToken = chrome.artifactLoadToken();
   chrome.runTimers(25);
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   chrome.sendFrameMessage({
     artifact_load_token: oldToken,
@@ -1256,7 +1283,7 @@ test("a failed begin-load keeps the previous frame until a retry succeeds", asyn
     { ok: false, status: 503 },
     { ok: true, json: async () => ({ artifact_revision: 2, artifact_load_token: "retry-load" }) },
   );
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   assert.equal(chrome.frame.src, previousSrc);
 
@@ -1284,7 +1311,7 @@ test("exhausted begin-load retries preserve the previous frame without waking th
   const previousSrc = chrome.frame.src;
   const previousToken = chrome.artifactLoadToken();
   beginLoadResponses.push({ ok: false, status: 503 }, { ok: false, status: 503 }, { ok: false, status: 503 });
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   chrome.runTimers(100);
   await flushPromises();
@@ -1309,7 +1336,7 @@ test("a current load token accepts artifact messages before the frame load event
     },
   });
 
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   const currentToken = chrome.artifactLoadToken();
   chrome.sendFrameMessage({
@@ -1340,7 +1367,7 @@ test("a pre-load diagnostic silences the probe even while its response is delaye
     },
   });
 
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   chrome.sendFrameMessage({ type: "lavish:layoutDiagnostics", complete: true, findings: [] });
   await flushPromises();
@@ -1367,7 +1394,7 @@ test("stale artifact messages are ignored until the current frame load", async (
   });
 
   const oldToken = chrome.artifactLoadToken();
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   chrome.sendFrameMessage({
     artifact_load_token: oldToken,
@@ -1459,7 +1486,7 @@ test("a stale artifact probe cannot report failure after a reload", async () => 
     1,
   );
 
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
   await flushPromises();
   assert.ok(releaseProbe);
   releaseProbe();
@@ -1521,7 +1548,7 @@ test("layout gate manual override stays bypassed on reload", async () => {
   const chrome = await createChromeHarness();
 
   chrome.element("layoutGateAction").onclick();
-  chrome.eventSource().listeners.get("reload")();
+  chrome.liveListener("reload")();
 
   assert.equal(chrome.element("layoutGateOverlay").hidden, true);
   assert.equal(chrome.element("body").classList.contains("layout-gate-active"), false);
@@ -1629,12 +1656,12 @@ test("chrome shows queued, sent, delivered, and acknowledged feedback states", a
   assert.equal(chrome.element("feedbackStatus").dataset.state, "sent");
   assert.match(chrome.element("feedbackStatus").textContent, /Sent to Lavish/);
 
-  chrome.eventSource().listeners.get("feedback-delivered")({
+  chrome.liveListener("feedback-delivered")({
     data: JSON.stringify({ feedback_id: "feedback-1" }),
   });
   assert.equal(chrome.element("feedbackStatus").dataset.state, "delivered");
 
-  chrome.eventSource().listeners.get("feedback-acknowledged")({
+  chrome.liveListener("feedback-acknowledged")({
     data: JSON.stringify({ feedback_id: "feedback-1" }),
   });
   assert.equal(chrome.element("feedbackStatus").dataset.state, "acknowledged");
@@ -2055,7 +2082,7 @@ test("server restart flushes an authenticated inline whiteboard before reloading
   });
   const inline = await initializeInlineWhiteboard(chrome);
 
-  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  const restart = chrome.liveListener("chrome-reload")();
   await flushPromises();
   chrome.runTimers(100);
   await flushPromises();
@@ -2105,7 +2132,7 @@ test("server restart flushes an authenticated overlay before reloading", async (
   await flushPromises();
   await flushPromises();
 
-  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  const restart = chrome.liveListener("chrome-reload")();
   await flushPromises();
   chrome.runTimers(100);
   await flushPromises();
@@ -2140,7 +2167,7 @@ test("server restart bounds the wait for a whiteboard flush", async () => {
   });
   const inline = await initializeInlineWhiteboard(chrome);
 
-  const restart = chrome.eventSource().listeners.get("chrome-reload")();
+  const restart = chrome.liveListener("chrome-reload")();
   await flushPromises();
   chrome.runTimers(100);
   await flushPromises();
@@ -2264,4 +2291,87 @@ test("a local asset failure inside the artifact is reported as a fatal artifact 
   const failure = posts.find((post) => post.url === "/api/abc/artifact-failures");
   assert.equal(failure.body.failures[0].kind, "artifact-asset-unavailable");
   assert.match(failure.body.failures[0].detail, /logo\.png/);
+});
+
+test("review page takes live updates over a WebSocket, not a held event stream", async () => {
+  const chrome = await createChromeHarness();
+
+  assert.equal(chrome.liveSockets.length, 1);
+  assert.equal(chrome.liveSockets[0].url, "ws://127.0.0.1:4531/live/abc");
+  assert.equal(chrome.eventSources.length, 0);
+
+  chrome.liveListener("agent-reply")({ data: JSON.stringify({ text: "Over the socket." }) });
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Over the socket\./);
+});
+
+test("review page reconnects its live socket after the connection drops", async () => {
+  const requests = [];
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      requests.push(String(url));
+      return { ok: true, json: async () => ({ warnings: [] }) };
+    },
+  });
+  const first = chrome.liveSockets[0];
+  first.dispatch("open");
+  first.dispatch("close");
+  await flushPromises();
+  assert.equal(chrome.liveSockets.length, 1, "waits before reconnecting");
+
+  chrome.runTimers(500);
+  assert.equal(chrome.liveSockets.length, 2);
+  const layoutRefreshes = requests.filter((url) => url.endsWith("/layout-warnings")).length;
+  chrome.liveSockets[1].dispatch("open");
+  assert.equal(
+    requests.filter((url) => url.endsWith("/layout-warnings")).length,
+    layoutRefreshes + 1,
+    "a reconnected page refreshes state it may have missed",
+  );
+  assert.equal(chrome.eventSources.length, 0);
+});
+
+test("review page keeps retrying its socket while the server is down", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async (url) => {
+      if (url === "/health") throw new Error("server is restarting");
+      return { ok: true, json: async () => ({}) };
+    },
+  });
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    chrome.liveSockets.at(-1).dispatch("close");
+    await flushPromises();
+    chrome.runTimers();
+  }
+  assert.equal(chrome.liveSockets.length, 5);
+  assert.equal(chrome.eventSources.length, 0, "a server that is down is not a server without sockets");
+});
+
+test("review page falls back to the event stream when a running server refuses the socket", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+  chrome.liveSockets[0].dispatch("close");
+  await flushPromises();
+  chrome.runTimers();
+  chrome.liveSockets[1].dispatch("close");
+  await flushPromises();
+
+  assert.equal(chrome.eventSources.length, 1);
+  assert.equal(chrome.eventSources[0].url, "/events/abc");
+  chrome.eventSources[0].listeners.get("agent-reply")({ data: JSON.stringify({ text: "Over the stream." }) });
+  assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Over the stream\./);
+});
+
+test("review page does not reconnect a socket the server closed for a restart", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+  const socket = chrome.liveSockets[0];
+  socket.dispatch("open");
+  chrome.liveListener("chrome-reload")();
+  socket.dispatch("close");
+  await flushPromises();
+  chrome.runTimers(500);
+
+  assert.equal(chrome.liveSockets.length, 1);
 });

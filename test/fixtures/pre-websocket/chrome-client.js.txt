@@ -1918,108 +1918,27 @@ frame.addEventListener("load", () => {
 
 initializeLayoutGate();
 
-// Live updates ride a WebSocket. Chrome allows six HTTP/1.1 connections per host, and a held
-// EventSource per review page left a seventh tab blank; WebSockets do not count toward that cap.
-// A server that refuses the upgrade while it is up (an older Lavish, or a proxy without WebSocket
-// support) gets the `/events` stream instead.
-const liveHandlers = {
-  reload: () => {
-    resetFrame().then((reloaded) => {
-      if (reloaded) refreshWhiteboardSource();
-    });
-  },
-  "chrome-reload": () => reloadAfterServerRestart(),
-  "agent-reply": (data) => addChat("agent", data.text),
-  "chat-sync": (data) => syncChat(data.chat || []),
-  "agent-presence": (data) => setAgentPresence(data.state),
-  "layout-warnings": (data) => setLayoutWarnings(data.warnings || []),
-  "feedback-delivered": (data) => setFeedbackStatus("delivered", data.feedback_id || ""),
-  "feedback-acknowledged": (data) => {
-    const feedbackId = data.feedback_id || "";
-    if (!feedbackDeliveryId || feedbackDeliveryId === String(feedbackId)) setFeedbackStatus("acknowledged", feedbackId);
-  },
-};
-const LIVE_RETRY_MIN_MS = 500;
-const LIVE_RETRY_MAX_MS = 5000;
-const LIVE_SOCKET_REFUSALS_BEFORE_FALLBACK = 2;
-let liveRetryMs = LIVE_RETRY_MIN_MS;
-let liveSocketRefusals = 0;
-
-function handleLiveEvent(type, data) {
-  const handler = liveHandlers[type];
-  return handler ? handler(data || {}) : undefined;
-}
-
-// A (re)connected channel may have missed updates while it was away.
-function handleLiveOpen() {
-  refreshLayoutWarnings();
-}
-
-function liveSocketUrl() {
-  return (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/live/" + encodeURIComponent(key);
-}
-
-function connectLiveUpdates() {
-  let opened = false;
-  let socket;
-  try {
-    socket = new WebSocket(liveSocketUrl());
-  } catch {
-    connectLiveEventStream();
-    return;
-  }
-  socket.addEventListener("open", () => {
-    opened = true;
-    liveRetryMs = LIVE_RETRY_MIN_MS;
-    liveSocketRefusals = 0;
-    handleLiveOpen();
+const events = new EventSource("/events/" + key);
+events.addEventListener("reload", () => {
+  resetFrame().then((reloaded) => {
+    if (reloaded) refreshWhiteboardSource();
   });
-  socket.addEventListener("message", (event) => {
-    let message;
-    try {
-      message = JSON.parse(event.data);
-    } catch {
-      return undefined;
-    }
-    return handleLiveEvent(message.event, message.data);
-  });
-  socket.addEventListener("close", () => {
-    reconnectLiveUpdates(opened).catch(() => {});
-  });
-}
-
-async function reconnectLiveUpdates(wasOpen) {
-  // A restarting server already told this chrome to reload once the new server is up.
-  if (chromeRestartReloadPromise) return;
-  if (!wasOpen && (await serverAnswers())) {
-    liveSocketRefusals += 1;
-    if (liveSocketRefusals >= LIVE_SOCKET_REFUSALS_BEFORE_FALLBACK) {
-      connectLiveEventStream();
-      return;
-    }
-  }
-  const delay = liveRetryMs;
-  liveRetryMs = Math.min(liveRetryMs * 2, LIVE_RETRY_MAX_MS);
-  setTimeout(connectLiveUpdates, delay);
-}
-
-async function serverAnswers() {
-  try {
-    return (await fetch("/health", { cache: "no-store" })).ok;
-  } catch {
-    return false;
-  }
-}
-
-function connectLiveEventStream() {
-  const stream = new EventSource("/events/" + key);
-  for (const type of Object.keys(liveHandlers)) {
-    stream.addEventListener(type, (event) => handleLiveEvent(type, JSON.parse(event.data)));
-  }
-  stream.addEventListener("open", handleLiveOpen);
-}
-
-connectLiveUpdates();
+});
+events.addEventListener("chrome-reload", () => reloadAfterServerRestart());
+events.addEventListener("agent-reply", (event) => addChat("agent", JSON.parse(event.data).text));
+events.addEventListener("chat-sync", (event) => syncChat(JSON.parse(event.data).chat || []));
+events.addEventListener("agent-presence", (event) => setAgentPresence(JSON.parse(event.data).state));
+events.addEventListener("layout-warnings", (event) => setLayoutWarnings(JSON.parse(event.data).warnings || []));
+// A reconnecting stream means this chrome may have missed updates while it was away.
+events.addEventListener("open", () => refreshLayoutWarnings());
+events.addEventListener("feedback-delivered", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  setFeedbackStatus("delivered", feedbackId);
+});
+events.addEventListener("feedback-acknowledged", (event) => {
+  const feedbackId = JSON.parse(event.data).feedback_id || "";
+  if (!feedbackDeliveryId || feedbackDeliveryId === String(feedbackId)) setFeedbackStatus("acknowledged", feedbackId);
+});
 
 render();
 setWarningsDrawerOpen(false);

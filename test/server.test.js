@@ -26,6 +26,7 @@ import {
   resolveWatchTarget,
   serve,
 } from "../src/server.js";
+import { connectLivePage } from "./live-page-client.js";
 import { canonicalFile, sessionKey } from "../src/session-store.js";
 
 async function chromeClientSource() {
@@ -80,36 +81,13 @@ function chromeSessionData(html) {
 }
 
 async function startPresenceStream(base, key) {
-  const controller = new AbortController();
-  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
+  const page = connectLivePage(base, key);
+  await page.opened;
   return {
     async next() {
-      const deadline = Date.now() + 500;
-      while (true) {
-        const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-        if (match) {
-          buffer = buffer.replace(match[0], "");
-          return JSON.parse(match[1]).state;
-        }
-        const remaining = Math.max(1, deadline - Date.now());
-        const { value, done } = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error("timed out waiting for agent presence event")), remaining),
-          ),
-        ]);
-        if (done) throw new Error("presence stream closed before an agent presence event");
-        buffer += decoder.decode(value, { stream: true });
-      }
+      return (await page.next("agent-presence", 500)).state;
     },
-    async close() {
-      controller.abort();
-      await reader.cancel().catch(() => {});
-    },
+    close: () => page.close(),
   };
 }
 
@@ -889,7 +867,7 @@ test("chrome waits for the replacement server before version-driven reload", asy
   assert.match(js, /async function reloadAfterServerRestart\(\)/);
   assert.match(js, /let sawOutage = false/);
   assert.match(js, /if \(sawOutage && res\.ok\) \{/);
-  assert.match(js, /addEventListener\("chrome-reload", \(\) => reloadAfterServerRestart\(\)\)/);
+  assert.match(js, /"chrome-reload": \(\) => reloadAfterServerRestart\(\)/);
 });
 
 test("chrome restores queued prompts from tab storage after reload", async () => {
@@ -2197,7 +2175,7 @@ test("/chrome-client.js serves the extracted chrome client script", async () => 
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") || "", /application\/javascript/);
     assert.match(body, /const sessionData/);
-    assert.match(body, /new EventSource\("\/events\/" \+ key\)/);
+    assert.match(body, /new WebSocket\(liveSocketUrl\(\)\)/);
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -2641,10 +2619,10 @@ test("an open SSE connection keeps the server alive past the idle timeout", asyn
       body: JSON.stringify({ file: artifact }),
     });
     const { key } = await open.json();
-    // Hold an SSE connection open so the server is never idle.
-    const sse = fetch(`${base}/events/${key}`, { signal: controller.signal });
-    sse.catch(() => {});
-    await sse;
+    // Hold a review page open so the server is never idle.
+    const page = connectLivePage(base, key);
+    await page.opened;
+    controller.signal.addEventListener("abort", () => page.socket.terminate());
     await new Promise((resolve) => setTimeout(resolve, 750));
     const health = await fetch(`${base}/health`);
     assert.equal(health.status, 200);
@@ -2961,7 +2939,7 @@ test("send-and-end prompt submissions wake active polls with ended attribution",
   }
 });
 
-test("SSE agent-presence reflects waiting, listening, and working transitions", async () => {
+test("live agent-presence reflects waiting, listening, and working transitions", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -2975,42 +2953,8 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
     });
     const { key } = await open.json();
 
-    const presenceEvents = [];
-    const presenceWaiters = [];
-    const presenceController = new AbortController();
-    const presenceFetch = fetch(`${base}/events/${key}`, { signal: presenceController.signal }).then(async (res) => {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
-          const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
-          buffer = buffer.replace(lines[0], "");
-          const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
-        }
-      }
-    });
-    presenceFetch.catch(() => {});
-
-    const waitForPresence = () =>
-      new Promise((resolve) => {
-        if (presenceEvents.length > waitForPresence.lastIndex) {
-          waitForPresence.lastIndex++;
-          resolve(presenceEvents[waitForPresence.lastIndex - 1]);
-          return;
-        }
-        presenceWaiters.push((state) => {
-          waitForPresence.lastIndex = presenceEvents.length;
-          resolve(state);
-        });
-      });
-    waitForPresence.lastIndex = 0;
+    const presencePage = connectLivePage(base, key);
+    const waitForPresence = async () => (await presencePage.next("agent-presence")).state;
 
     const initial = await waitForPresence();
     assert.equal(initial, "waiting", "first SSE handshake should report waiting before any poll");
@@ -3037,15 +2981,14 @@ test("SSE agent-presence reflects waiting, listening, and working transitions", 
     const working = await waitForPresence();
     assert.equal(working, "working", "should switch to working only after the agent acknowledges processing");
 
-    presenceController.abort();
-    await presenceFetch.catch(() => {});
+    await presencePage.close();
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("SSE handshake reports waiting on a fresh session that never had a poll", async () => {
+test("live channel handshake reports waiting on a fresh session that never had a poll", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3059,20 +3002,9 @@ test("SSE handshake reports waiting on a fresh session that never had a poll", a
     });
     const { key } = await open.json();
 
-    const controller = new AbortController();
-    const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let state = null;
-    while (state === null) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-      if (match) state = JSON.parse(match[1]).state;
-    }
-    controller.abort();
+    const page = connectLivePage(base, key);
+    const { state } = await page.next("agent-presence");
+    await page.close();
     assert.equal(state, "waiting");
   } finally {
     await server.close();
@@ -3080,7 +3012,7 @@ test("SSE handshake reports waiting on a fresh session that never had a poll", a
   }
 });
 
-test("SSE agent-presence returns to waiting when a poll times out without feedback", async () => {
+test("live agent-presence returns to waiting when a poll times out without feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3111,7 +3043,7 @@ test("SSE agent-presence returns to waiting when a poll times out without feedba
   }
 });
 
-test("SSE agent-presence returns to waiting when a poll disconnects without feedback", async () => {
+test("live agent-presence returns to waiting when a poll disconnects without feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3146,7 +3078,7 @@ test("SSE agent-presence returns to waiting when a poll disconnects without feed
   }
 });
 
-test("SSE agent-presence returns to waiting when poll feedback storage fails", async () => {
+test("live agent-presence returns to waiting when poll feedback storage fails", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   const stateFile = path.join(dir, "state.json");
@@ -3197,7 +3129,7 @@ test("heartbeat long-poll errors close the stream without Express error handling
   assert.match(source, /respond\(\)\.catch\(handleRespondError\)/);
 });
 
-test("SSE agent-presence switches to working after acknowledging immediately delivered feedback", async () => {
+test("live agent-presence switches to working after acknowledging immediately delivered feedback", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3211,45 +3143,8 @@ test("SSE agent-presence switches to working after acknowledging immediately del
     });
     const { key } = await open.json();
 
-    const presenceEvents = [];
-    const presenceWaiters = [];
-    const presenceController = new AbortController();
-    const presenceFetch = fetch(`${base}/events/${key}`, { signal: presenceController.signal }).then(async (res) => {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let lines;
-        while ((lines = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m))) {
-          const data = JSON.parse(lines[1]);
-          presenceEvents.push(data.state);
-          buffer = buffer.replace(lines[0], "");
-          const waiter = presenceWaiters.shift();
-          if (waiter) waiter(data.state);
-        }
-      }
-    });
-    presenceFetch.catch(() => {});
-
-    const waitForPresence = () =>
-      new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("timed out waiting for agent presence event")), 500);
-        if (presenceEvents.length > waitForPresence.lastIndex) {
-          waitForPresence.lastIndex++;
-          clearTimeout(timer);
-          resolve(presenceEvents[waitForPresence.lastIndex - 1]);
-          return;
-        }
-        presenceWaiters.push((state) => {
-          waitForPresence.lastIndex = presenceEvents.length;
-          clearTimeout(timer);
-          resolve(state);
-        });
-      });
-    waitForPresence.lastIndex = 0;
+    const presencePage = connectLivePage(base, key);
+    const waitForPresence = async () => (await presencePage.next("agent-presence")).state;
 
     const initial = await waitForPresence();
     assert.equal(initial, "waiting");
@@ -3269,15 +3164,14 @@ test("SSE agent-presence switches to working after acknowledging immediately del
     const working = await waitForPresence();
     assert.equal(working, "working");
 
-    presenceController.abort();
-    await presenceFetch.catch(() => {});
+    await presencePage.close();
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("SSE agent-presence resets to waiting after ending and reopening a session", async () => {
+test("live agent-presence resets to waiting after ending and reopening a session", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3331,7 +3225,7 @@ test("SSE agent-presence resets to waiting after ending and reopening a session"
   }
 });
 
-test("SSE agent-presence returns to waiting after an agent reply", async () => {
+test("live agent-presence returns to waiting after an agent reply", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3380,7 +3274,7 @@ test("SSE agent-presence returns to waiting after an agent reply", async () => {
   }
 });
 
-test("SSE agent-presence stays working when resuming an open session", async () => {
+test("live agent-presence stays working when resuming an open session", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await writeFile(artifact, "<!doctype html><html><body></body></html>");

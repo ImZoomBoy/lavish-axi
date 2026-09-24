@@ -55,42 +55,16 @@ import { resolveVsCodeSettingsFile } from "../src/plugin.js";
 import { createSkillMarkdown } from "../src/skill.js";
 import { SELF_PAINT_WARNING } from "../src/self-paint.js";
 import { serve } from "../src/server.js";
+import { connectLivePage } from "./live-page-client.js";
 import { canonicalFile, sessionKey } from "../src/session-store.js";
 
 async function waitForPollListening(base, key, timeoutMs = 10_000) {
-  const controller = new AbortController();
-  const res = await fetch(`${base}/events/${key}`, { signal: controller.signal });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const page = connectLivePage(base, key);
   const deadline = Date.now() + timeoutMs;
   try {
-    while (true) {
-      const match = buffer.match(/^event: agent-presence\ndata: (.+)\n\n/m);
-      if (match) {
-        buffer = buffer.replace(match[0], "");
-        if (JSON.parse(match[1]).state === "listening") return;
-        continue;
-      }
-      const remaining = Math.max(1, deadline - Date.now());
-      let timer;
-      let value;
-      let done;
-      try {
-        ({ value, done } = await Promise.race([
-          reader.read(),
-          new Promise((_, reject) => {
-            timer = setTimeout(() => reject(new Error("timed out waiting for listening presence")), remaining);
-          }),
-        ]));
-      } finally {
-        clearTimeout(timer);
-      }
-      if (done) throw new Error("presence stream closed before listening");
-      buffer += decoder.decode(value, { stream: true });
-    }
+    while ((await page.next("agent-presence", Math.max(1, deadline - Date.now()))).state !== "listening");
   } finally {
-    controller.abort();
+    await page.close();
   }
 }
 
@@ -1761,13 +1735,11 @@ test("an open review page counts as live work and keeps the server from being re
     });
     const { key } = await sessionResponse.json();
 
-    // The review page holds the session's event stream open for as long as it is open.
-    const events = await fetch(`${base}/events/${key}`, { signal: page.signal });
-    const reader = events.body.getReader();
-    const pageClosed = (async () => {
-      while (!(await reader.read()).done);
-      return true;
-    })().catch(() => true);
+    // The review page holds its live socket open for as long as it is open.
+    const livePage = connectLivePage(base, key);
+    await livePage.opened;
+    page.signal.addEventListener("abort", () => livePage.socket.terminate());
+    const pageClosed = livePage.closed.then(() => true);
     const before = await (await fetch(`${base}/health`)).json();
     assert.deepEqual(before.live, { polls: 0, pages: 1 });
 
