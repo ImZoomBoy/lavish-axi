@@ -61,6 +61,12 @@ export const POLL_WAKE_PATH_RULES = Object.freeze([
 ]);
 export const POLL_SEND_AND_END_RULE =
   "`Send & End` ends the session. Its final feedback is still delivered once. After that response, polling stops, and the agent must not reopen the session uninvited.";
+// Before this rule, agents ended their turn with no poll running, and feedback the user sent
+// then sat unread until the user pasted it into the chat by hand.
+export const POLL_BEFORE_TURN_END_RULE =
+  "You may give the user the session link, but start the poll in this same turn. Do not end your turn, or reply to the user as if you are finished, before the poll is running.";
+const CLAUDE_POLL_WAKE_PATH_GUIDANCE =
+  "Claude detected: Claude's `run_in_background` is a completion-aware background facility. When the poll returns, it wakes the same agent, including in a T3 Code thread or a Claude desktop session.";
 const CODEX_POLL_WAKE_PATH_GUIDANCE =
   "Codex detected: completed background tasks may not resume Codex automatically, so keep the poll attached to the active turn.";
 const FEEDBACK_RECEIPT_GUIDANCE =
@@ -71,7 +77,11 @@ export const VERSION =
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
 export function detectInvokingAgent(env = process.env) {
-  return ["CODEX_SANDBOX", "CODEX_THREAD_ID"].some((key) => Object.hasOwn(env, key)) ? "codex" : "generic";
+  if (["CODEX_SANDBOX", "CODEX_THREAD_ID"].some((key) => Object.hasOwn(env, key))) return "codex";
+  // Claude Code sets CLAUDECODE for the commands it runs, including under the Agent SDK that
+  // T3 Code and the Claude desktop app use.
+  if (Object.hasOwn(env, "CLAUDECODE")) return "claude";
+  return "generic";
 }
 
 export function shouldNarratePollWaitTicks({ isTTY }) {
@@ -80,7 +90,12 @@ export function shouldNarratePollWaitTicks({ isTTY }) {
 
 export function pollExecutionGuidance({ agent = "generic" } = {}) {
   const sharedGuidance = POLL_WAKE_PATH_RULES.join(" ");
-  const agentGuidance = agent === "codex" ? ` ${CODEX_POLL_WAKE_PATH_GUIDANCE}` : "";
+  const agentGuidance =
+    agent === "codex"
+      ? ` ${CODEX_POLL_WAKE_PATH_GUIDANCE}`
+      : agent === "claude"
+        ? ` ${CLAUDE_POLL_WAKE_PATH_GUIDANCE}`
+        : "";
   return `${sharedGuidance}${agentGuidance}`;
 }
 
@@ -234,14 +249,21 @@ export function createPlaybookOutput(args) {
   return { playbook };
 }
 
+// The poll command leads the output so it survives when an agent cuts the output short with
+// `head` or `sed`; the session block comes last.
 export function createOpenOutput({ file, url, status, agent = "generic", selfPaintWarning = undefined }) {
   const selfPaintPrefix = selfPaintWarning
     ? `First fix the unpainted page surface flagged in self_paint_warning and save - Lavish live-reloads the artifact automatically, so you do not need to re-run \`lavish-axi ${file}\`. `
     : "";
+  const launchText =
+    status === "launch-requested"
+      ? "Lavish asked the system to open the review page in a browser, but it cannot confirm the page loaded. Tell the user the browser launch was requested and give them the session URL from `session.url` as a clickable link - do not say the page is open."
+      : "Lavish did not open a browser for this session. Give the user the session URL from `session.url` as a clickable link.";
   return {
-    session: { file, url, status },
+    poll_command: `lavish-axi poll ${file}`,
+    next_step: `${selfPaintPrefix}Now you must run \`lavish-axi poll ${file}\`. ${launchText} ${POLL_BEFORE_TURN_END_RULE} This command long-polls until the user sends feedback or ends the session, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance({ agent })} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
     ...(selfPaintWarning ? { self_paint_warning: selfPaintWarning } : {}),
-    next_step: `${selfPaintPrefix}Do not respond to the user just yet. Now you must run \`lavish-axi poll ${file}\`. This command long-polls until the user sends feedback or ends the session, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance({ agent })} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    session: { file, url, status },
   };
 }
 
@@ -271,18 +293,22 @@ async function openCommand(args) {
   if (response.status === "user-ended") {
     return createUserEndedOpenOutput({ file: absolute, url: response.url });
   }
+  // `open` only hands the URL to the system; nothing confirms a page loaded, so the status
+  // says the launch was requested rather than that the page is open.
+  let status = "ready";
   if (shouldOpenBrowser(args, process.env)) {
     try {
       const open = (await import("open")).default;
       await open(response.url);
+      status = "launch-requested";
     } catch {
-      response.status = "ready";
+      // The launch failed, so the status stays "ready".
     }
   }
   return createOpenOutput({
     file: absolute,
     url: response.url,
-    status: response.status || "opened",
+    status,
     agent: detectInvokingAgent(process.env),
     selfPaintWarning,
   });
@@ -339,9 +365,13 @@ async function pollCommand(args) {
         narrateTicks: shouldNarratePollWaitTicks({ isTTY: process.stderr.isTTY }),
       });
   try {
-    const response = await fetchJson(`${baseUrl}/api/poll?file=${encodeURIComponent(absolute)}${timeoutQuery}`, {
+    // Only the no-timeout poll reconnects. A timed poll is a test and debug hatch that must
+    // return within its bound, and a reconnect would restart the server-side timeout.
+    const response = await fetchPollJson(`${baseUrl}/api/poll?file=${encodeURIComponent(absolute)}${timeoutQuery}`, {
       retries: 3,
       retryDelayMs: 500,
+      reconnectWindowMs: timeoutMs ? 0 : POLL_RECONNECT_WINDOW_MS,
+      onReconnect: () => process.stderr.write(`${pollReconnectingText(absolute)}\n`),
     });
     const output = createPollOutput({ file: absolute, response, agent: detectInvokingAgent(process.env) });
     if (response.status === "feedback" && response.feedback_id) {
@@ -404,6 +434,13 @@ export function pollInterruptedText(file) {
   return (
     `[lavish-axi] Poll interrupted before user feedback arrived. The user may still be reviewing - ` +
     `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost.`
+  );
+}
+
+export function pollReconnectingText(file) {
+  return (
+    `[lavish-axi] Lost the connection to the Lavish Editor server while polling ${file}. ` +
+    `Reconnecting and waiting again - queued feedback is kept on the server.`
   );
 }
 
@@ -1142,6 +1179,13 @@ async function ensureServer({ forceRestart = false } = {}) {
   if (existing && !shouldRestartServer(VERSION, existing, forceRestart)) {
     return baseUrl;
   }
+  // Shutting a server down closes every connection, so replacing one that holds live work
+  // would cut another agent's waiting poll or the user's open review page. Use it as is; a
+  // later command replaces it once nothing is connected.
+  if (existing && serverHasLiveWork(existing)) {
+    process.stderr.write(`${keptServerNotice({ port, serverVersion: existing.version, cliVersion: VERSION })}\n`);
+    return baseUrl;
+  }
   if (existing) {
     if (!(await canControlServerOnPort(port, existing, processOnPortMatchesLavish))) {
       throw new AxiError(`Port ${port} is occupied by a non-Lavish server`, "SERVER_ERROR", [
@@ -1183,8 +1227,32 @@ async function ensureServer({ forceRestart = false } = {}) {
 export function shouldRestartServer(currentVersion, healthBody, forceRestart = false) {
   if (!healthBody || typeof healthBody !== "object") return false;
   if (forceRestart && healthBody.app === "lavish-axi") return true;
-  if (typeof healthBody.version !== "string" || healthBody.version === "") return true;
+  if (isPreHandshakeHealth(healthBody)) return true;
   return healthBody.version !== currentVersion;
+}
+
+// A server from before the version handshake reports no version in /health.
+function isPreHandshakeHealth(healthBody) {
+  return typeof healthBody.version !== "string" || healthBody.version === "";
+}
+
+// True when replacing the running server could cut live work. A Lavish server that predates
+// the `live` report cannot say, so it counts as live; only a pre-handshake server with no
+// version at all is still replaced unconditionally, as before.
+export function serverHasLiveWork(healthBody) {
+  if (!healthBody || typeof healthBody !== "object" || healthBody.app !== "lavish-axi") return false;
+  if (isPreHandshakeHealth(healthBody)) return false;
+  const live = healthBody.live;
+  if (!live || typeof live !== "object") return true;
+  return Number(live.polls) > 0 || Number(live.pages) > 0;
+}
+
+export function keptServerNotice({ port, serverVersion, cliVersion }) {
+  return (
+    `[lavish-axi] Using the running Lavish Editor server on port ${port} (version ${serverVersion}) as is, although this CLI is version ${cliVersion}. ` +
+    `It has live polls or open review pages (or is too old to report them), and replacing it would cut them. ` +
+    `A later lavish-axi command replaces it once nothing is connected.`
+  );
 }
 
 export function shouldForceRestartForLocalBuild(executablePath, sourceServerExists = localSourceServerExists()) {
@@ -1337,10 +1405,45 @@ export async function fetchJson(url, { retries = 0, retryDelayMs = 250 } = {}) {
   if (!response.ok) {
     throw new AxiError(`Lavish Editor request failed: ${response.status}`, "SERVER_ERROR");
   }
+  let body;
   try {
-    return await response.json();
+    body = await response.text();
+  } catch {
+    throw new ResponseCutError();
+  }
+  try {
+    return JSON.parse(body);
   } catch {
     throw pollResponseInterruptedError();
+  }
+}
+
+export const POLL_RECONNECT_WINDOW_MS = 30_000;
+
+// `reconnectWindowMs` > 0 turns a connection cut mid-response (a server restart, a version
+// swap) into a reconnect: the request is re-sent until it connects again, for at most that
+// long after the cut. Queued feedback stays on the server, so re-sending the poll is safe.
+// A reconnected request that is cut again before the window passes does not restart it, so
+// a server that keeps dropping the poll still ends it.
+export async function fetchPollJson(
+  url,
+  { retries = 0, retryDelayMs = 250, reconnectWindowMs = 0, onReconnect = () => {} } = {},
+) {
+  let lostAt = null;
+  while (true) {
+    const requestStartedAt = Date.now();
+    try {
+      return await fetchJson(url, { retries: lostAt === null ? retries : 0, retryDelayMs });
+    } catch (error) {
+      const cut = error instanceof ResponseCutError;
+      if (reconnectWindowMs <= 0) throw error;
+      if (!cut && !(error instanceof ServerConnectionError && lostAt !== null)) throw error;
+      const now = Date.now();
+      if (cut && (lostAt === null || now - requestStartedAt >= reconnectWindowMs)) lostAt = now;
+      if (now - lostAt >= reconnectWindowMs) throw pollReconnectFailedError(reconnectWindowMs);
+      if (cut) onReconnect();
+      await delay(retryDelayMs);
+    }
   }
 }
 
@@ -1361,18 +1464,42 @@ async function postJson(url, body) {
   return response.json();
 }
 
+const SERVER_DIAGNOSTICS_HELP = Object.freeze([
+  "Run `lavish-axi server --verbose` or inspect `~/.lavish-axi/server.log` (`LAVISH_AXI_STATE_DIR/server.log` when set) for server startup or crash diagnostics",
+  "Re-run the last `lavish-axi poll <html-file>` command after the server is healthy",
+]);
+
+// Typed so fetchPollJson can tell a refused connection and a cut response apart from other
+// failures; both still render as ordinary SERVER_ERROR output.
+class ServerConnectionError extends AxiError {
+  constructor() {
+    super("Lavish Editor server connection failed", "SERVER_ERROR", [...SERVER_DIAGNOSTICS_HELP]);
+  }
+}
+
+class ResponseCutError extends AxiError {
+  constructor() {
+    super("Lavish Editor poll response was interrupted", "SERVER_ERROR", [...SERVER_DIAGNOSTICS_HELP]);
+  }
+}
+
 function serverConnectionError() {
-  return new AxiError("Lavish Editor server connection failed", "SERVER_ERROR", [
-    "Run `lavish-axi server --verbose` or inspect `~/.lavish-axi/server.log` (`LAVISH_AXI_STATE_DIR/server.log` when set) for server startup or crash diagnostics",
-    "Re-run the last `lavish-axi poll <html-file>` command after the server is healthy",
-  ]);
+  return new ServerConnectionError();
 }
 
 function pollResponseInterruptedError() {
-  return new AxiError("Lavish Editor poll response was interrupted", "SERVER_ERROR", [
-    "Run `lavish-axi server --verbose` or inspect `~/.lavish-axi/server.log` (`LAVISH_AXI_STATE_DIR/server.log` when set) for server startup or crash diagnostics",
-    "Re-run the last `lavish-axi poll <html-file>` command after the server is healthy",
-  ]);
+  return new AxiError("Lavish Editor poll response was interrupted", "SERVER_ERROR", [...SERVER_DIAGNOSTICS_HELP]);
+}
+
+function pollReconnectFailedError(windowMs) {
+  return new AxiError(
+    `Lavish Editor server did not come back within ${Math.round(windowMs / 1000)}s after the poll connection was cut`,
+    "SERVER_ERROR",
+    [
+      "Run `lavish-axi server --verbose` or inspect `~/.lavish-axi/server.log` (`LAVISH_AXI_STATE_DIR/server.log` when set) for server startup or crash diagnostics",
+      "Re-run the last `lavish-axi poll <html-file>` command after the server is healthy - queued feedback is kept",
+    ],
+  );
 }
 
 function positionalArgs(args, valueFlags = []) {
@@ -1437,7 +1564,7 @@ function createTopLevelHelp({ agent = "generic" } = {}) {
 
 function createCommandHelp({ agent = "generic" } = {}) {
   return {
-    open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag.\n`,
+    open: `Usage: lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n\nOpen or resume a Lavish Editor review session for an HTML artifact. Use --no-open when you need to ensure the server/session exists without opening another browser window. Use --no-gate to skip the open-time layout curtain for this browser open. If the user explicitly ended the session from the browser, this refuses to reopen it and returns guidance instead - pass --reopen to force it open when the user asks for further review or something important needs their visual attention. Sessions ended by the agent (\`lavish-axi end\`) reopen normally without the flag. Follow the next_step in the output.\n`,
     poll: `Usage: lavish-axi poll <html-file> [--agent-reply "..."]\n\nThis command long-polls indefinitely for queued user prompts. A feedback response includes a receipt with status "delivered" and a feedback_id; after reading and applying the batch, run \`lavish-axi ack <html-file> <feedback-id>\` so Lavish knows the agent processed it. It stays silent while it waits - that is normal, never kill it. Browser-detected layout issues do NOT return this poll: they are filed passively in the user's Layout issues inbox and arrive as an ordinary tag "layout-warnings" prompt only after the user selects them and queues the fixes. Warning lifecycle: an issue stays unresolved and counted while queued, becomes recurring if a newer artifact revision still shows it, and is resolved only after a newer artifact load plus a complete diagnostic pass at the same viewport no longer detects it. A failed or incomplete pass preserves it as unverified rather than clearing it. The only response that arrives without user action is artifact_failures - a fatal failure that made the review surface itself unusable. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} Use --agent-reply after applying prior feedback to display your response in Lavish Editor before waiting again. ${POLL_SEND_AND_END_RULE}\n`,
     ack: `Usage: lavish-axi ack <html-file> <feedback-id>\n\nAcknowledge a feedback batch after the agent has read and processed it. The feedback_id comes from the preceding \`lavish-axi poll\` response. Until this command succeeds, a re-run of poll returns the same batch so interrupted agent work is safe.\n`,
     end: `Usage: lavish-axi end <html-file>\n\nEnd a Lavish Editor session as the agent. A session ended this way still reopens normally on the next \`lavish-axi <html-file>\`, unlike a user ending it from the browser, which requires --reopen.\n`,

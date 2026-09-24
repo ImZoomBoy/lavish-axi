@@ -10,10 +10,6 @@ import {
   validateSkillMarkdown,
 } from "../src/skill.js";
 
-function skillCommandText(text) {
-  return text.replaceAll("`lavish-axi", "`npx -y lavish-axi");
-}
-
 test("createSkillMarkdown emits valid frontmatter naming the lavish skill", () => {
   const { frontmatter, errors } = parseSkillFrontmatter(createSkillMarkdown());
 
@@ -83,7 +79,7 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
   const md = createSkillMarkdown();
   const home = createHomeOutput({ bin: "lavish-axi", sessions: [], includeSessions: false, agent: "static" });
 
-  assert.ok(md.includes(skillCommandText(home.description)), "includes the product description");
+  assert.ok(md.includes(home.description), "includes the product description");
 
   for (const item of home.visual_guidance) {
     assert.ok(md.includes(item), `includes visual guidance: ${item.slice(0, 32)}...`);
@@ -95,8 +91,7 @@ test("createSkillMarkdown mirrors the no-args home output", () => {
   }
 
   for (const item of home.help) {
-    const skillItem = skillCommandText(item);
-    assert.ok(md.includes(skillItem), `includes help: ${skillItem.slice(0, 32)}...`);
+    assert.ok(md.includes(item), `includes help: ${item.slice(0, 32)}...`);
   }
 });
 
@@ -164,22 +159,16 @@ test("createSkillMarkdown omits setup guidance", () => {
   assert.doesNotMatch(md, /setup plugin/);
 });
 
-test("createSkillMarkdown uses non-interactive npx commands", () => {
+test("createSkillMarkdown prefers an installed lavish-axi over npx", () => {
   const md = createSkillMarkdown();
 
-  assert.match(md, /`npx -y lavish-axi <html-file>`/);
-  assert.match(md, /If lavish-axi output shows a follow-up command starting with `lavish-axi`/);
-  assert.match(md, /run it as `npx -y lavish-axi/);
-  assert.doesNotMatch(md, /`npx lavish-axi/);
-  assert.doesNotMatch(md, /Run `lavish-axi/);
-});
-
-test("createSkillMarkdown documents installed-copy fallback for restricted sandboxes", () => {
-  const md = createSkillMarkdown();
-
-  assert.match(md, /restricted subprocess sandboxes/);
+  assert.match(md, /Prefer an installed copy of lavish-axi/);
+  assert.match(md, /If `lavish-axi --version` succeeds, run the bare `lavish-axi` bin/);
+  assert.match(md, /`node "\$\(npm root -g\)\/lavish-axi\/dist\/cli\.mjs"` for a global install/);
+  assert.match(md, /`node "\$\(npm root\)\/lavish-axi\/dist\/cli\.mjs"` for a local install/);
+  assert.match(md, /Only when no installed copy is found, run every command as `npx -y lavish-axi \.\.\.`/);
   assert.match(md, /status 216/);
-  assert.match(md, /`node "\$\(npm root\)\/lavish-axi\/dist\/cli\.mjs" <html-file>`/);
-  assert.match(md, /`node "\$\(npm root -g\)\/lavish-axi\/dist\/cli\.mjs" <html-file>`/);
-  assert.match(md, /bare `lavish-axi <html-file>` bin/);
+  assert.match(md, /Run `lavish-axi <html-file>`/, "commands use the installed bin");
+  assert.equal(md.match(/npx -y lavish-axi/g)?.length, 1, "npx appears only as the last-resort fallback");
+  assert.doesNotMatch(md, /`npx lavish-axi/);
 });

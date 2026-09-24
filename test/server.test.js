@@ -939,6 +939,7 @@ test("/health reports the server version so clients can detect upgrades", async 
     const body = await res.json();
     assert.equal(body.ok, true);
     assert.equal(body.version, "9.9.9-test");
+    assert.deepEqual(body.live, { polls: 0, pages: 0 });
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
