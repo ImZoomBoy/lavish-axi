@@ -67,6 +67,7 @@ export class SessionStore {
         status: existingStatus === "feedback" && existingPrompts.length === 0 ? "open" : existingStatus,
         pending_prompts: existing.pending_prompts || 0,
         inflight_feedback: existing.inflight_feedback || null,
+        acknowledged_feedback: existing.acknowledged_feedback || null,
         accepted_submission_ids: existing.accepted_submission_ids || [],
         prompts: existingPrompts,
         // The warning inbox is durable review state, not deliverable feedback: reopening a session
@@ -496,6 +497,8 @@ export class SessionStore {
       }
 
       session.inflight_feedback = null;
+      // Review pages that were away when the receipt went out read it from here.
+      session.acknowledged_feedback = { feedback_id: normalizedFeedbackId, at: new Date().toISOString() };
       if (session.status !== "ended") {
         session.status =
           (session.prompts || []).length > 0 || (session.artifact_failures || []).length > 0 ? "feedback" : "open";

@@ -1,0 +1,190 @@
+{
+  "sessions": {
+    "25bcf393d2917c15": {
+      "key": "25bcf393d2917c15",
+      "file": "__ARTIFACT_ROOT__/alpha/.lavish/plan.html",
+      "url": "http://127.0.0.1:4533/session/25bcf393d2917c15",
+      "status": "feedback",
+      "pending_prompts": 2,
+      "inflight_feedback": null,
+      "accepted_submission_ids": ["sub-plan-1"],
+      "prompts": [
+        {
+          "uid": "",
+          "prompt": "Make the header bigger",
+          "selector": "h1",
+          "tag": "element",
+          "text": ""
+        },
+        {
+          "uid": "",
+          "prompt": "Looks close.",
+          "selector": "",
+          "tag": "message",
+          "text": ""
+        }
+      ],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "<h1>Prototype</h1>",
+      "chat": [
+        {
+          "role": "agent",
+          "text": "Here is the plan.",
+          "at": "2026-09-24T15:26:59.124Z"
+        },
+        {
+          "role": "user",
+          "text": "Make the header bigger",
+          "at": "2026-09-24T15:26:59.130Z"
+        },
+        {
+          "role": "user",
+          "text": "Looks close.",
+          "at": "2026-09-24T15:26:59.130Z"
+        }
+      ],
+      "updated_at": "2026-09-24T15:26:59.130Z"
+    },
+    "68d4b3ca7b67c353": {
+      "key": "68d4b3ca7b67c353",
+      "file": "__ARTIFACT_ROOT__/alpha/.lavish/review.html",
+      "url": "http://127.0.0.1:4533/session/68d4b3ca7b67c353",
+      "status": "open",
+      "pending_prompts": 0,
+      "inflight_feedback": {
+        "feedback_id": "0647a5e1-37da-4a72-bed6-7d92f4258062",
+        "dom_snapshot": "",
+        "prompts": [
+          {
+            "uid": "",
+            "prompt": "Tighten this copy",
+            "selector": "#copy",
+            "tag": "element",
+            "text": ""
+          }
+        ]
+      },
+      "accepted_submission_ids": ["sub-review-1"],
+      "prompts": [],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "",
+      "chat": [
+        {
+          "role": "user",
+          "text": "Tighten this copy",
+          "at": "2026-09-24T15:26:59.147Z"
+        }
+      ],
+      "updated_at": "2026-09-24T15:26:59.153Z"
+    },
+    "e582c649e3632ec1": {
+      "key": "e582c649e3632ec1",
+      "file": "__ARTIFACT_ROOT__/beta/.lavish/board.html",
+      "url": "http://127.0.0.1:4533/session/e582c649e3632ec1",
+      "status": "open",
+      "pending_prompts": 0,
+      "inflight_feedback": null,
+      "accepted_submission_ids": ["sub-board-1"],
+      "prompts": [],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "",
+      "chat": [
+        {
+          "role": "user",
+          "text": "Swap the columns.",
+          "at": "2026-09-24T15:26:59.168Z"
+        },
+        {
+          "role": "agent",
+          "text": "Swapped them.",
+          "at": "2026-09-24T15:26:59.184Z"
+        }
+      ],
+      "updated_at": "2026-09-24T15:26:59.184Z"
+    },
+    "446981024fc1c703": {
+      "key": "446981024fc1c703",
+      "file": "__ARTIFACT_ROOT__/beta/.lavish/diagram.html",
+      "url": "http://127.0.0.1:4533/session/446981024fc1c703",
+      "status": "feedback",
+      "pending_prompts": 1,
+      "inflight_feedback": null,
+      "accepted_submission_ids": ["sub-diagram-1"],
+      "prompts": [
+        {
+          "uid": "",
+          "prompt": "Move Start left.",
+          "selector": "",
+          "tag": "message",
+          "text": ""
+        }
+      ],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "",
+      "chat": [
+        {
+          "role": "user",
+          "text": "Move Start left.",
+          "at": "2026-09-24T15:26:59.203Z"
+        }
+      ],
+      "updated_at": "2026-09-24T15:26:59.203Z"
+    },
+    "2402a7337aa4ba1a": {
+      "key": "2402a7337aa4ba1a",
+      "file": "__ARTIFACT_ROOT__/gamma/notes.html",
+      "url": "http://127.0.0.1:4533/session/2402a7337aa4ba1a",
+      "status": "ended",
+      "pending_prompts": 0,
+      "inflight_feedback": null,
+      "accepted_submission_ids": [],
+      "prompts": [],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "",
+      "chat": [],
+      "updated_at": "2026-09-24T15:26:59.218Z",
+      "ended_by": "agent"
+    },
+    "c1fab78c02f04bfc": {
+      "key": "c1fab78c02f04bfc",
+      "file": "__ARTIFACT_ROOT__/gamma/ended.html",
+      "url": "http://127.0.0.1:4533/session/c1fab78c02f04bfc",
+      "status": "ended",
+      "pending_prompts": 1,
+      "inflight_feedback": null,
+      "accepted_submission_ids": ["sub-ended-1"],
+      "prompts": [
+        {
+          "uid": "",
+          "prompt": "Ship it.",
+          "selector": "",
+          "tag": "message",
+          "text": ""
+        }
+      ],
+      "layout_warnings": [],
+      "artifact_revision": 0,
+      "artifact_failures": [],
+      "dom_snapshot": "",
+      "chat": [
+        {
+          "role": "user",
+          "text": "Ship it.",
+          "at": "2026-09-24T15:26:59.243Z"
+        }
+      ],
+      "updated_at": "2026-09-24T15:26:59.243Z",
+      "ended_by": "user"
+    }
+  }
+}
