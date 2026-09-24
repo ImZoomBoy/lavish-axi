@@ -18,6 +18,10 @@ const BIN = fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url));
 // 1000ms) plus process startup. This budget sits far below that and far above the
 // ~60ms the fast path actually needs, so it catches the regression without flaking.
 const VERSION_BUDGET_MS = 500;
+// The full suite starts many test processes at once, and a cold start can queue behind them for
+// CPU. The fastest of a few runs measures the command itself; a regression pays the drain on
+// every run.
+const VERSION_ATTEMPTS = 3;
 
 // Accepts the telemetry connection and never answers, so a regression pays the whole
 // drain timeout instead of a fast connection refusal.
@@ -73,14 +77,17 @@ test("--version prints the version fast and skips telemetry and state-dir init",
   };
 
   for (const flag of ["--version", "-v", "-V"]) {
-    const startedAt = process.hrtime.bigint();
-    const { stdout } = await execFileAsync(process.execPath, [BIN, flag], { env });
-    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-
-    assert.equal(stdout, `${VERSION}\n`);
+    const timings = [];
+    for (let attempt = 0; attempt < VERSION_ATTEMPTS; attempt += 1) {
+      const startedAt = process.hrtime.bigint();
+      const { stdout } = await execFileAsync(process.execPath, [BIN, flag], { env });
+      timings.push(Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6));
+      assert.equal(stdout, `${VERSION}\n`);
+      if (timings[timings.length - 1] < VERSION_BUDGET_MS) break;
+    }
     assert.ok(
-      elapsedMs < VERSION_BUDGET_MS,
-      `\`${flag}\` took ${Math.round(elapsedMs)}ms, over the ${VERSION_BUDGET_MS}ms budget`,
+      Math.min(...timings) < VERSION_BUDGET_MS,
+      `\`${flag}\` took ${timings.join("ms, ")}ms, over the ${VERSION_BUDGET_MS}ms budget`,
     );
   }
 

@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 
 import chokidar from "chokidar";
 import express from "express";
-import { WebSocketServer } from "ws";
 
 import {
   classifySevereTextOverflow,
@@ -141,6 +140,8 @@ export async function serve({
   allowedHosts = extraAllowedHosts(),
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
 }) {
+  // Loaded here, not at the top: the CLI imports this module, and `--version` must stay fast.
+  const { WebSocketServer } = await import("ws");
   const app = express();
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
