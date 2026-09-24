@@ -1,4 +1,4 @@
-import { POLL_SEND_AND_END_RULE, POLL_WAKE_PATH_RULES, createHomeOutput } from "./cli.js";
+import { POLL_BEFORE_TURN_END_RULE, POLL_SEND_AND_END_RULE, POLL_WAKE_PATH_RULES, createHomeOutput } from "./cli.js";
 import { PLAYBOOK_ROUTER_HELP } from "./playbooks.js";
 
 // Trigger string Claude Code (and other agents) match against to auto-load the skill.
@@ -82,7 +82,7 @@ ${home.help[home.help.length - 1]}
 
 1. Create the HTML artifact (default location \`.lavish/<name>.html\` in the working directory).
 2. Run \`lavish-axi <html-file>\` to open or resume a review session in the browser.
-   The output leads with \`poll_command\`. It reports a browser launch only as requested, never as the page being open, so give the user the session URL from \`session.url\` as a clickable link.
+   Follow the \`next_step\` in its output. ${POLL_BEFORE_TURN_END_RULE}
    If the output carries a \`self_paint_warning\`, fix the unpainted page surface and save before polling - Lavish live-reloads the artifact.
 3. Run \`lavish-axi poll <html-file>\` to long-poll for the user's annotations and queued prompts.
    On the first poll, prefer \`--agent-reply "<one-line summary of what you built and what to review first>"\` so the conversation panel opens with context.

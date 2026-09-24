@@ -29,6 +29,7 @@ import {
   createUserEndedOpenOutput,
   detectInvokingAgent,
   fetchJson,
+  fetchPollJson,
   getCommandHelp,
   normalizeArgv,
   pollInterruptedText,
@@ -798,12 +799,37 @@ test("open output reports the browser launch as requested and asks for the sessi
   assert.match(notLaunched.next_step, /session URL from `session\.url` as a clickable link/);
 });
 
-test("poll wake-path guidance names Claude's run_in_background as completion-aware", () => {
-  const output = createOpenOutput({ file: "/tmp/artifact.html", url: "u", status: "ready" });
-  for (const text of [output.next_step, getCommandHelp("poll"), createSkillMarkdown()]) {
-    assert.match(text, /Claude's `run_in_background` is such a completion-aware facility/);
+test("only Claude gets the run_in_background wake-path line", () => {
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CLAUDECODE: "1" }), "claude");
+  assert.equal(detectInvokingAgent({ PATH: "/bin", CLAUDECODE: "1", CODEX_THREAD_ID: "thread" }), "codex");
+
+  const claudeLine = /Claude's `run_in_background` is a completion-aware background facility/;
+  const claudeOpen = createOpenOutput({ file: "/tmp/artifact.html", url: "u", status: "ready", agent: "claude" });
+  for (const text of [claudeOpen.next_step, getCommandHelp("poll", { agent: "claude" })]) {
+    assert.match(text, claudeLine);
     assert.match(text, /T3 Code thread or a Claude desktop session/);
   }
+
+  for (const agent of ["generic", "codex"]) {
+    const output = createOpenOutput({ file: "/tmp/artifact.html", url: "u", status: "ready", agent });
+    assert.doesNotMatch(output.next_step, /run_in_background/);
+    assert.doesNotMatch(getCommandHelp("poll", { agent }), /run_in_background/);
+  }
+  assert.doesNotMatch(createSkillMarkdown(), /run_in_background/);
+});
+
+test("open output makes the agent start the poll before its turn ends", () => {
+  const output = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+    status: "launch-requested",
+  });
+  assert.match(output.next_step, /You may give the user the session link, but start the poll in this same turn\./);
+  assert.match(
+    output.next_step,
+    /Do not end your turn, or reply to the user as if you are finished, before the poll is running\./,
+  );
+  assert.match(createSkillMarkdown(), /Do not end your turn, or reply to the user as if you are finished/);
 });
 
 test("open output gives Codex the shared wake-path contract plus an attached-turn warning", () => {
@@ -1720,6 +1746,91 @@ test("a CLI of another version keeps the server while it holds a waiting poll", 
   }
 });
 
+test("an open review page counts as live work and keeps the server from being replaced", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-live-page-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  const server = await serve({ port: 0, stateFile: `${stateDir}/state.json`, version: VERSION });
+  const base = `http://127.0.0.1:${server.port}`;
+  const page = new AbortController();
+  try {
+    const sessionResponse = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await sessionResponse.json();
+
+    // The review page holds the session's event stream open for as long as it is open.
+    const events = await fetch(`${base}/events/${key}`, { signal: page.signal });
+    const reader = events.body.getReader();
+    const pageClosed = (async () => {
+      while (!(await reader.read()).done);
+      return true;
+    })().catch(() => true);
+    const before = await (await fetch(`${base}/health`)).json();
+    assert.deepEqual(before.live, { polls: 0, pages: 1 });
+
+    const other = spawnCli(["poll", artifact, "--timeout-ms", "200"], {
+      ...process.env,
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_PORT: String(server.port),
+      LAVISH_AXI_BUILD_VERSION: "0.0.0-other-version-test",
+    });
+    const otherResult = await withTimeout(other.closed, 20_000, "other-version CLI");
+    assert.equal(otherResult.code, 0, other.output.stdout);
+    const closedEarly = await Promise.race([
+      pageClosed,
+      new Promise((resolve) => setTimeout(() => resolve(false), 300)),
+    ]);
+    assert.equal(closedEarly, false, "the open review page kept its connection");
+    const health = await (await fetch(`${base}/health`)).json();
+    assert.equal(health.version, VERSION, "the running server was kept");
+    assert.match(other.output.stderr, /live polls or open review pages/);
+  } finally {
+    page.abort();
+    await stopForeignServer(base, VERSION);
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test("a timed poll does not reconnect when its connection is cut", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-timed-poll-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  let pollRequests = 0;
+  const fake = createServer((req, res) => {
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, app: "lavish-axi", version: VERSION, live: { polls: 0, pages: 0 } }));
+      return;
+    }
+    pollRequests += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write(" ");
+    setImmediate(() => res.socket?.destroy());
+  });
+  await new Promise((resolve) => fake.listen(0, "127.0.0.1", () => resolve()));
+  try {
+    const address = fake.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
+    const poll = spawnCli(["poll", artifact, "--timeout-ms", "5000"], {
+      ...process.env,
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_PORT: String(address.port),
+    });
+    const result = await withTimeout(poll.closed, 20_000, "timed poll");
+    assert.equal(result.code, 1);
+    assert.match(poll.output.stdout, /Lavish Editor poll response was interrupted/);
+    assert.doesNotMatch(poll.output.stderr, /Reconnecting/);
+    assert.equal(pollRequests, 1);
+  } finally {
+    await new Promise((resolve) => fake.close(resolve));
+    await rm(stateDir, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
 test("spawned poll reconnects when its connection is cut and still delivers feedback", async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-reconnect-test-`);
   const artifact = `${stateDir}/artifact.html`;
@@ -2466,7 +2577,7 @@ test("fetchJson reports interrupted response body failures without retrying", as
   }
 });
 
-test("fetchJson ends a reconnecting poll with a clear error when the server is gone for good", async () => {
+test("fetchPollJson ends a reconnecting poll with a clear error when the server is gone for good", async () => {
   let requests = 0;
   const server = createServer((req, res) => {
     requests += 1;
@@ -2484,7 +2595,7 @@ test("fetchJson ends a reconnecting poll with a clear error when the server is g
   let reconnects = 0;
   await assert.rejects(
     () =>
-      fetchJson(`http://127.0.0.1:${address.port}/api/poll`, {
+      fetchPollJson(`http://127.0.0.1:${address.port}/api/poll`, {
         retryDelayMs: 20,
         reconnectWindowMs: 300,
         onReconnect: () => {
@@ -2502,7 +2613,7 @@ test("fetchJson ends a reconnecting poll with a clear error when the server is g
   assert.equal(reconnects, 1);
 });
 
-test("fetchJson stops reconnecting to a server that keeps cutting the poll", async () => {
+test("fetchPollJson stops reconnecting to a server that keeps cutting the poll", async () => {
   const server = createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.write(" ");
@@ -2513,7 +2624,7 @@ test("fetchJson stops reconnecting to a server that keeps cutting the poll", asy
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
     await assert.rejects(
-      () => fetchJson(`http://127.0.0.1:${address.port}/api/poll`, { retryDelayMs: 20, reconnectWindowMs: 300 }),
+      () => fetchPollJson(`http://127.0.0.1:${address.port}/api/poll`, { retryDelayMs: 20, reconnectWindowMs: 300 }),
       /did not come back/,
     );
   } finally {
