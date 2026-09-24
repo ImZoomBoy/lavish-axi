@@ -76,6 +76,16 @@ export const VERSION =
   process.env.LAVISH_AXI_BUILD_VERSION ||
   JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 
+// Agents paste printed commands into a shell. Git Bash, which Claude Code runs commands through on
+// Windows, reads each unquoted backslash in a Windows path as an escape, so the command fails.
+// Quote any argument that is not plain. Single quotes keep every character literal in POSIX
+// shells and in PowerShell.
+export function shellQuote(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_/.:@%+=,-]+$/.test(text)) return text;
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
 export function detectInvokingAgent(env = process.env) {
   if (["CODEX_SANDBOX", "CODEX_THREAD_ID"].some((key) => Object.hasOwn(env, key))) return "codex";
   // Claude Code sets CLAUDECODE for the commands it runs, including under the Agent SDK that
@@ -217,7 +227,7 @@ export function createHomeOutput({ bin, sessions, includeSessions = true, agent 
       "Run `lavish-axi <html-file>` to open or resume a Lavish Editor session. If the user explicitly ended the session from the browser, this refuses to reopen it and explains why instead of reopening uninvited - pass `--reopen` only when the user asks for further review or something important needs their visual attention",
       "Unless the user specifies another location, create HTML artifacts in the current working directory under `.lavish/`",
       "Lavish serves the html file through a local express.js server. If your html needs to reference other filesystem assets such as images, CSS, fonts, and local scripts, copy them into the same directory as the HTML file, then reference them with relative paths from that directory. Never prepend `/` to those asset paths - root paths won't work",
-      `Run \`lavish-axi poll <html-file>\` to wait for user feedback. It long-polls and stays silent until the user sends feedback or ends the session, so leave it running - never kill it. A feedback response is delivered with a feedback_id; after reading and applying it, run \`lavish-axi ack <html-file> <feedback_id>\` before polling again. Detected layout issues never return this poll: the browser files them in the user's Layout issues inbox in the Lavish top bar, and they arrive as an ordinary tag "layout-warnings" prompt only when the user selects them and queues the fixes. Never edit the artifact to chase a layout issue the user has not queued. The only exception is a fatal artifact_failures response, which means the review surface itself could not be used. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}`,
+      `Run \`lavish-axi poll <html-file>\` to wait for user feedback. ${POLL_BEFORE_TURN_END_RULE} It long-polls and stays silent until the user sends feedback or ends the session, so leave it running - never kill it. When a feedback response carries a feedback_id, run \`lavish-axi ack <html-file> <feedback_id>\` after reading and applying it, before polling again. Detected layout issues never return this poll: the browser files them in the user's Layout issues inbox in the Lavish top bar, and they arrive as an ordinary tag "layout-warnings" prompt only when the user selects them and queues the fixes. Never edit the artifact to chase a layout issue the user has not queued. The only exception is a fatal artifact_failures response, which means the review surface itself could not be used. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}`,
       'Rendered Mermaid diagrams in `.mermaid` containers become embedded, editable Excalidraw whiteboards in the browser (click a diagram to unlock editing; a Fullscreen action opens it over the whole viewport) - flowchart, sequence, class, ER, and state diagrams convert to editable shapes; other types embed as an image to draw on. Scenes autosave locally; when a reload detects a changed Mermaid source, the reviewer explicitly chooses to re-convert and discard saved edits or keep editing the saved scene. Standalone and exported copies still render plain Mermaid. Queue feedback adds a prompt to the Conversation panel; when the user sends it, poll returns a tag "whiteboard" prompt carrying a bounded edit summary plus local scenePath (.excalidraw JSON) and previewPath (PNG) files - read the summary first, open the files only when needed, then apply the edits by updating the Mermaid source in the artifact (never try to write the scene back)',
       "Run `lavish-axi end <html-file>` to end a session as the agent - ending it this way still allows a plain reopen later. When the user ends it from the browser instead, a later `lavish-axi <html-file>` refuses to reopen it without `--reopen`",
       "Run `lavish-axi export <html-file> [--out <path>]` to write a portable copy of the artifact - one HTML file with its LOCAL assets inlined - so it opens with no Lavish server and no sibling files. Remote CDN/font references are left as links, so it needs network to render those. Users can also export from the browser chrome's overflow menu",
@@ -253,15 +263,15 @@ export function createPlaybookOutput(args) {
 // `head` or `sed`; the session block comes last.
 export function createOpenOutput({ file, url, status, agent = "generic", selfPaintWarning = undefined }) {
   const selfPaintPrefix = selfPaintWarning
-    ? `First fix the unpainted page surface flagged in self_paint_warning and save - Lavish live-reloads the artifact automatically, so you do not need to re-run \`lavish-axi ${file}\`. `
+    ? `First fix the unpainted page surface flagged in self_paint_warning and save - Lavish live-reloads the artifact automatically, so you do not need to re-run \`lavish-axi ${shellQuote(file)}\`. `
     : "";
   const launchText =
     status === "launch-requested"
       ? "Lavish asked the system to open the review page in a browser, but it cannot confirm the page loaded. Tell the user the browser launch was requested and give them the session URL from `session.url` as a clickable link - do not say the page is open."
       : "Lavish did not open a browser for this session. Give the user the session URL from `session.url` as a clickable link.";
   return {
-    poll_command: `lavish-axi poll ${file}`,
-    next_step: `${selfPaintPrefix}Now you must run \`lavish-axi poll ${file}\`. ${launchText} ${POLL_BEFORE_TURN_END_RULE} This command long-polls until the user sends feedback or ends the session, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance({ agent })} After applying feedback, run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${file}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    poll_command: `lavish-axi poll ${shellQuote(file)}`,
+    next_step: `${selfPaintPrefix}Now you must run \`lavish-axi poll ${shellQuote(file)}\`. ${launchText} ${POLL_BEFORE_TURN_END_RULE} This command long-polls until the user sends feedback or ends the session, and it stays silent the whole time - that is normal, never kill it. Layout issues the browser detects do not return this poll; they wait in the user's Layout issues inbox until the user queues them, then arrive as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use. ${pollExecutionGuidance({ agent })} After applying feedback, run \`lavish-axi poll ${shellQuote(file)} --agent-reply "<message for the user>"\` without --timeout-ms to show your response in Lavish Editor and wait for more feedback. If the user ends the session, stop polling and do not reopen it by re-running \`lavish-axi ${shellQuote(file)}\` unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${shellQuote(file)} --reopen\`.`,
     ...(selfPaintWarning ? { self_paint_warning: selfPaintWarning } : {}),
     session: { file, url, status },
   };
@@ -274,7 +284,7 @@ export function createOpenOutput({ file, url, status, agent = "generic", selfPai
 export function createUserEndedOpenOutput({ file, url }) {
   return {
     session: { file, url, status: "user-ended" },
-    next_step: `The user explicitly ended this Lavish Editor session from the browser, so \`lavish-axi ${file}\` did not reopen it. Do not reopen unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${file} --reopen\`.`,
+    next_step: `The user explicitly ended this Lavish Editor session from the browser, so \`lavish-axi ${shellQuote(file)}\` did not reopen it. Do not reopen unless the user asks for further review or something genuinely important needs their visual attention - deliver routine updates directly in this conversation instead. When reopening is warranted, run \`lavish-axi ${shellQuote(file)} --reopen\`.`,
   };
 }
 
@@ -407,13 +417,17 @@ async function ackCommand(args) {
   if (response.status !== "acknowledged" && response.status !== "already-acknowledged") {
     throw new AxiError(`Lavish Editor could not acknowledge feedback: ${response.status}`, "SERVER_ERROR");
   }
+  return createAckOutput({ absolute, response, feedbackId });
+}
+
+export function createAckOutput({ absolute, response, feedbackId }) {
   return {
     session: {
       file: absolute,
       status: "acknowledged",
       feedback_id: response.feedback_id || feedbackId,
     },
-    next_step: `The feedback batch ${response.status === "already-acknowledged" ? "was already acknowledged" : "is acknowledged"}. Continue applying the requested changes, then run \`lavish-axi poll ${absolute} --agent-reply "<message for the user>"\` to show the update and wait for more feedback.`,
+    next_step: `The feedback batch ${response.status === "already-acknowledged" ? "was already acknowledged" : "is acknowledged"}. Continue applying the requested changes, then run \`lavish-axi poll ${shellQuote(absolute)} --agent-reply "<message for the user>"\` to show the update and wait for more feedback.`,
   };
 }
 
@@ -421,7 +435,7 @@ export function pollWaitBannerText(file) {
   return (
     `[lavish-axi] Long-polling for user feedback on ${file}. This stays silent until the user sends feedback or ends the session - leave it running. ` +
     `Detected layout issues do NOT return this poll: they wait in the user's Layout issues inbox until the user queues them as ordinary feedback. ` +
-    `If it gets killed or times out, re-run \`lavish-axi poll ${file}\` - queued feedback is never lost.`
+    `If it gets killed or times out, re-run \`lavish-axi poll ${shellQuote(file)}\` - queued feedback is never lost.`
   );
 }
 
@@ -433,7 +447,7 @@ export function pollWaitTickText(elapsedMs) {
 export function pollInterruptedText(file) {
   return (
     `[lavish-axi] Poll interrupted before user feedback arrived. The user may still be reviewing - ` +
-    `re-run \`lavish-axi poll ${file}\` to keep waiting; queued feedback is never lost.`
+    `re-run \`lavish-axi poll ${shellQuote(file)}\` to keep waiting; queued feedback is never lost.`
   );
 }
 
@@ -476,7 +490,7 @@ export function startPollWaitReporter({
 export function createPollOutput({ file, response, agent = "generic" }) {
   if (response.status === "missing") {
     throw new AxiError("No active Lavish Editor session for this file", "NOT_FOUND", [
-      `Run \`lavish-axi ${file}\` first`,
+      `Run \`lavish-axi ${shellQuote(file)}\` first`,
     ]);
   }
   if (response.status === "feedback") {
@@ -512,7 +526,7 @@ export function createPollOutput({ file, response, agent = "generic" }) {
   }
   return {
     session: { file, status: response.status || "waiting" },
-    next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${file}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.`,
+    next_step: `No user feedback arrived before the optional timeout. Run \`lavish-axi poll ${shellQuote(file)}\` without --timeout-ms to wait indefinitely - queued feedback is never lost, so re-running the poll is always safe.`,
   };
 }
 
@@ -526,10 +540,12 @@ function createFeedbackNextStep(
   agent = "generic",
 ) {
   const count = artifactFailures.length;
-  const receiptNote = `${FEEDBACK_RECEIPT_GUIDANCE} `;
+  // Only a server with the acknowledgement route returns a feedback_id. Without one there is
+  // nothing to ack and an ack would fail, so the guidance leaves acknowledgement out.
+  const receiptNote = feedbackId ? `${FEEDBACK_RECEIPT_GUIDANCE} ` : "";
   const acknowledgementNote = feedbackId
-    ? `After you have read and applied this batch, run \`lavish-axi ack ${file} ${feedbackId}\` before polling again. `
-    : "After the poll returns a feedback_id, acknowledge the batch with `lavish-axi ack <html-file> <feedback_id>` after applying it. ";
+    ? `After you have read and applied this batch, run \`lavish-axi ack ${shellQuote(file)} ${feedbackId}\` before polling again. `
+    : "";
   const whiteboardNote = prompts.some((prompt) => prompt && prompt.tag === "whiteboard")
     ? `This feedback includes whiteboard edits (tag "whiteboard"): read the edit summary in the prompt text first, and only when it is not enough, open the target's scenePath (.excalidraw scene JSON) or previewPath (PNG) local files for detail. The artifact's Mermaid source stays authoritative - apply the edits by updating the Mermaid text in ${file} (Lavish live-reloads it); never try to write the .excalidraw scene back. `
     : "";
@@ -541,23 +557,23 @@ function createFeedbackNextStep(
       count > 0
         ? endedBy === "user"
           ? `${count} fatal artifact failure${count === 1 ? "" : "s"} arrived alongside this final feedback - the review surface itself could not be used. Repair ${file}, then open it directly and confirm it renders without reopening this ended Lavish session. `
-          : `${count} fatal artifact failure${count === 1 ? "" : "s"} arrived alongside this final feedback - the review surface itself could not be used. Repair ${file}, then run \`lavish-axi ${file}\` to open a fresh session. `
+          : `${count} fatal artifact failure${count === 1 ? "" : "s"} arrived alongside this final feedback - the review surface itself could not be used. Repair ${file}, then run \`lavish-axi ${shellQuote(file)}\` to open a fresh session. `
         : "";
     if (endedBy === "user") {
       const reopenNote =
         count > 0
           ? ""
-          : ` Only run \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
+          : ` Only run \`lavish-axi ${shellQuote(file)} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
       return `${receiptNote}${acknowledgementNote}${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the user ended the session. Stop polling ${file} and do not reopen it - deliver any remaining updates directly in this conversation instead.${reopenNote}`;
     }
-    return `${receiptNote}${acknowledgementNote}${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
+    return `${receiptNote}${acknowledgementNote}${failureNote}${layoutNote}${whiteboardNote}This was the last feedback before the Lavish Editor session ended. Stop polling ${file}. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${shellQuote(file)}\` to open a fresh session if the user needs further visual review.`;
   }
   const prefix =
     count > 0 ? artifactFailuresPrefix(file, artifactFailures) : `Apply the requested changes to ${file}. `;
-  const nextPoll = `run \`lavish-axi poll ${file} --agent-reply "<message for the user>"\` without --timeout-ms`;
+  const nextPoll = `\`lavish-axi poll ${shellQuote(file)} --agent-reply "<message for the user>"\` without --timeout-ms`;
   const acknowledgementStep = feedbackId
-    ? `First run \`lavish-axi ack ${file} ${feedbackId}\` after applying this batch, then ${nextPoll}`
-    : `Acknowledge the batch with \`lavish-axi ack <html-file> <feedback_id>\` after applying it, then ${nextPoll}`;
+    ? `First run \`lavish-axi ack ${shellQuote(file)} ${feedbackId}\` after applying this batch, then run ${nextPoll}`
+    : `Run ${nextPoll}`;
   return `${receiptNote}${prefix}${layoutNote}${whiteboardNote}Do not respond to the user just yet. ${acknowledgementStep} unless the user ended the session. The poll waits silently until the user sends more feedback or ends the session - never kill it. ${pollExecutionGuidance({ agent })}`;
 }
 
@@ -571,14 +587,14 @@ function artifactFailuresPrefix(file, artifactFailures) {
     .map((failure) => `${failure.kind}: ${failure.detail}`)
     .slice(0, 5)
     .join("; ");
-  return `${count} fatal artifact failure${plural} detected - the review surface could not be used (${details}). Repair ${file} so it renders with all of its local assets, then re-check in the browser. Lavish live-reloads the artifact automatically after you save, so you do not need to re-run \`lavish-axi ${file}\` for this. `;
+  return `${count} fatal artifact failure${plural} detected - the review surface could not be used (${details}). Repair ${file} so it renders with all of its local assets, then re-check in the browser. Lavish live-reloads the artifact automatically after you save, so you do not need to re-run \`lavish-axi ${shellQuote(file)}\` for this. `;
 }
 
 function createEndedNextStep(file, endedBy) {
   if (endedBy === "user") {
-    return `The user ended this Lavish Editor session. Stop polling ${file} - do not run \`lavish-axi ${file}\` to reopen it. Deliver any remaining updates directly in this conversation instead. Only reopen with \`lavish-axi ${file} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
+    return `The user ended this Lavish Editor session. Stop polling ${file} - do not run \`lavish-axi ${shellQuote(file)}\` to reopen it. Deliver any remaining updates directly in this conversation instead. Only reopen with \`lavish-axi ${shellQuote(file)} --reopen\` if the user explicitly asks for further review or something genuinely important needs their visual attention.`;
   }
-  return `This Lavish Editor session for ${file} has ended. Stop polling. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${file}\` to open a fresh session if the user needs further visual review.`;
+  return `This Lavish Editor session for ${file} has ended. Stop polling. Deliver any remaining updates directly in this conversation, or run \`lavish-axi ${shellQuote(file)}\` to open a fresh session if the user needs further visual review.`;
 }
 
 async function endCommand(args) {
@@ -1182,8 +1198,15 @@ async function ensureServer({ forceRestart = false } = {}) {
   // Shutting a server down closes every connection, so replacing one that holds live work
   // would cut another agent's waiting poll or the user's open review page. Use it as is; a
   // later command replaces it once nothing is connected.
-  if (existing && serverHasLiveWork(existing)) {
-    process.stderr.write(`${keptServerNotice({ port, serverVersion: existing.version, cliVersion: VERSION })}\n`);
+  const liveWork = existing
+    ? assessServerLiveWork(existing, {
+        countConnections: () => countServerConnections(listServerConnections(port), port),
+      })
+    : { live: false, basis: "report" };
+  if (liveWork.live) {
+    process.stderr.write(
+      `${keptServerNotice({ port, serverVersion: existing.version, cliVersion: VERSION, basis: liveWork.basis })}\n`,
+    );
     return baseUrl;
   }
   if (existing) {
@@ -1236,23 +1259,135 @@ function isPreHandshakeHealth(healthBody) {
   return typeof healthBody.version !== "string" || healthBody.version === "";
 }
 
-// True when replacing the running server could cut live work. A Lavish server that predates
-// the `live` report cannot say, so it counts as live; only a pre-handshake server with no
+// Whether replacing the running server could cut live work, and what that answer rests on.
+// A server that reports `live` counts is trusted. A versioned server from before that report
+// (including upstream releases) cannot say, so its open TCP connections are counted instead:
+// waiting polls and open review pages each hold one. Treating such a server as always live kept
+// an idle one on the port until its own idle timeout, and acks against it failed. When the
+// connections cannot be read, the server still counts as live. A pre-handshake server with no
 // version at all is still replaced unconditionally, as before.
-export function serverHasLiveWork(healthBody) {
-  if (!healthBody || typeof healthBody !== "object" || healthBody.app !== "lavish-axi") return false;
-  if (isPreHandshakeHealth(healthBody)) return false;
+export function assessServerLiveWork(healthBody, { countConnections = () => null } = {}) {
+  if (!healthBody || typeof healthBody !== "object" || healthBody.app !== "lavish-axi") {
+    return { live: false, basis: "none" };
+  }
+  if (isPreHandshakeHealth(healthBody)) return { live: false, basis: "none" };
   const live = healthBody.live;
-  if (!live || typeof live !== "object") return true;
-  return Number(live.polls) > 0 || Number(live.pages) > 0;
+  if (live && typeof live === "object") {
+    return { live: Number(live.polls) > 0 || Number(live.pages) > 0, basis: "report" };
+  }
+  const connections = countConnections();
+  if (connections === null) return { live: true, basis: "unknown" };
+  return { live: connections > 0, basis: "connections" };
 }
 
-export function keptServerNotice({ port, serverVersion, cliVersion }) {
+export function keptServerNotice({ port, serverVersion, cliVersion, basis = "report" }) {
+  const head = `[lavish-axi] Using the running Lavish Editor server on port ${port} (version ${serverVersion}) as is, although this CLI is version ${cliVersion}. `;
+  if (basis === "connections") {
+    return (
+      head +
+      `It is too old to report live work, but it has open connections, which may be polls or review pages, and replacing it would cut them. ` +
+      `A later lavish-axi command replaces it once nothing is connected.`
+    );
+  }
+  if (basis === "unknown") {
+    return (
+      head +
+      `It is too old to report live work, and this CLI could not check its connections, so it is kept in case a poll or review page is using it. ` +
+      `It stops by itself once nothing has been connected to it for its idle timeout. ` +
+      `To replace it sooner, run \`lavish-axi stop\` and then this command again; that cuts anything still connected to it.`
+    );
+  }
   return (
-    `[lavish-axi] Using the running Lavish Editor server on port ${port} (version ${serverVersion}) as is, although this CLI is version ${cliVersion}. ` +
-    `It has live polls or open review pages (or is too old to report them), and replacing it would cut them. ` +
+    head +
+    `It has live polls or open review pages, and replacing it would cut them. ` +
     `A later lavish-axi command replaces it once nothing is connected.`
   );
+}
+
+// Connection states that no longer carry a poll or a review page.
+const CLOSING_TCP_STATES = new Set([
+  "CLOSE_WAIT",
+  "CLOSED",
+  "CLOSING",
+  "FIN_WAIT1",
+  "FIN_WAIT2",
+  "FIN_WAIT_1",
+  "FIN_WAIT_2",
+  "LAST_ACK",
+  "TIME_WAIT",
+]);
+
+function portOf(address) {
+  const port = Number(address.slice(address.lastIndexOf(":") + 1));
+  return Number.isInteger(port) ? port : null;
+}
+
+// Rows are `{ pid, localPort, remotePort, state }`; a listening socket has remotePort 0.
+export function parseNetstatConnections(text) {
+  const rows = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts[0] !== "TCP" || parts.length < 5) continue;
+    const localPort = portOf(parts[1]);
+    const remotePort = portOf(parts[2]);
+    const pid = Number(parts[parts.length - 1]);
+    if (localPort === null || remotePort === null || !Number.isInteger(pid)) continue;
+    rows.push({ pid, localPort, remotePort, state: parts[3] });
+  }
+  return rows;
+}
+
+// Parses `lsof -F pnT` output: `p` starts a process, `n` names a socket, `TST=` gives its state.
+export function parseLsofConnections(text) {
+  const rows = [];
+  let pid = null;
+  for (const line of String(text).split(/\r?\n/)) {
+    if (line.startsWith("p")) {
+      pid = Number(line.slice(1));
+    } else if (line.startsWith("n") && Number.isInteger(pid)) {
+      const [local, remote] = line.slice(1).split("->");
+      const localPort = portOf(local);
+      const remotePort = remote ? portOf(remote) : 0;
+      if (localPort !== null && remotePort !== null) rows.push({ pid, localPort, remotePort, state: "" });
+    } else if (line.startsWith("TST=") && rows.length > 0) {
+      rows[rows.length - 1].state = line.slice(4);
+    }
+  }
+  return rows;
+}
+
+// Counts the connections open to the server listening on `port`, leaving out this process's
+// own (its /health request may still hold a pooled socket). Returns null when the rows do not
+// show the listening socket, because then they cannot be trusted to show its connections either.
+export function countServerConnections(rows, port, selfPid = process.pid) {
+  if (!rows) return null;
+  const listeners = new Set(rows.filter((row) => row.localPort === port && row.remotePort === 0).map((row) => row.pid));
+  if (listeners.size === 0) return null;
+  const ownPorts = new Set(
+    rows.filter((row) => row.pid === selfPid && row.remotePort === port).map((row) => row.localPort),
+  );
+  return rows.filter(
+    (row) =>
+      listeners.has(row.pid) &&
+      row.localPort === port &&
+      row.remotePort !== 0 &&
+      !CLOSING_TCP_STATES.has(row.state) &&
+      !ownPorts.has(row.remotePort),
+  ).length;
+}
+
+// Lists TCP sockets with netstat on Windows and lsof elsewhere. Returns null when the tool is
+// missing or fails.
+export function listServerConnections(port, { platform = process.platform, run = spawnSync } = {}) {
+  const [command, args] =
+    platform === "win32" ? ["netstat", ["-ano"]] : ["lsof", ["-nP", `-iTCP:${port}`, "-F", "pnT"]];
+  try {
+    const result = run(command, args, { encoding: "utf8", timeout: 5000, windowsHide: true });
+    if (result.error || typeof result.stdout !== "string") return null;
+    return platform === "win32" ? parseNetstatConnections(result.stdout) : parseLsofConnections(result.stdout);
+  } catch {
+    return null;
+  }
 }
 
 export function shouldForceRestartForLocalBuild(executablePath, sourceServerExists = localSourceServerExists()) {
@@ -1559,7 +1694,7 @@ export function getCommandHelp(command, { agent = "generic" } = {}) {
 }
 
 function createTopLevelHelp({ agent = "generic" } = {}) {
-  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. A feedback response is delivered with a feedback_id; after reading and applying it, run \`lavish-axi ack <html-file> <feedback_id>\` before polling again. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
+  return `lavish-axi - Lavish Editor AXI\n\nUsage:\n  lavish-axi\n  lavish-axi <html-file> [--no-open] [--no-gate] [--reopen]\n  lavish-axi poll <html-file> [--agent-reply "..."]\n  lavish-axi end <html-file>\n  lavish-axi export <html-file> [--out <path>]\n  lavish-axi share <html-file> [--password <pw>] [--token <t>]\n  lavish-axi stop\n  lavish-axi playbook [playbook_id]\n  lavish-axi design\n  lavish-axi setup hooks\n  lavish-axi setup plugin\n\n${DESIGN_SYSTEM_HINT}\n\nNote: poll long-polls indefinitely by default until the user sends feedback or ends the session, staying silent while it waits - never kill it. When a feedback response carries a feedback_id, run \`lavish-axi ack <html-file> <feedback_id>\` after reading and applying it, before polling again. Layout issues the browser detects are passive: they collect in the user's Layout issues inbox in the Lavish top bar and reach the agent only when the user selects them and queues the fixes, as an ordinary tag "layout-warnings" prompt. Do not pass --timeout-ms during normal agent use; it is for tests and debugging only. ${pollExecutionGuidance({ agent })} ${POLL_SEND_AND_END_RULE}\n\n`;
 }
 
 function createCommandHelp({ agent = "generic" } = {}) {
