@@ -732,17 +732,30 @@ export async function serve({
     }
   });
 
-  // The first events a page needs on every (re)connect, so it converges on server state.
-  async function pageSnapshot(key) {
+  // The first events a page needs on every (re)connect, so it converges on server state. A
+  // polling page that resyncs also gets `catchUp`: the reload and receipt it missed, which state
+  // alone cannot show. See createLivePages in src/live-updates.js.
+  /**
+   * @param {string} key
+   * @param {import("./live-updates.js").LegacyCatchUp | null} [catchUp]
+   */
+  async function pageSnapshot(key, catchUp = null) {
     const session = await store.findByKey(key);
     /** @type {Array<{ event: string, data: unknown }>} */
     const snapshot = [
       { event: "chat-sync", data: { chat: session?.chat || [] } },
       { event: "agent-presence", data: { state: computePresence(key, activePolls, deliveredFeedback) } },
     ];
+    const stored = session?.acknowledged_feedback;
+    const storedIsNewer =
+      catchUp?.acknowledgedSince != null && stored?.feedback_id && Date.parse(stored.at) >= catchUp.acknowledgedSince;
+    const acknowledgedId = catchUp?.acknowledgedFeedbackId || (storedIsNewer ? stored.feedback_id : null);
+    // Before any in-flight delivery, so a newer delivery stays the page's final status.
+    if (acknowledgedId) snapshot.push({ event: "feedback-acknowledged", data: { feedback_id: acknowledgedId } });
     if (session?.inflight_feedback?.feedback_id) {
       snapshot.push({ event: "feedback-delivered", data: { feedback_id: session.inflight_feedback.feedback_id } });
     }
+    if (catchUp?.reload) snapshot.push({ event: "reload", data: {} });
     return snapshot;
   }
 
@@ -752,14 +765,14 @@ export async function serve({
   app.get("/events/:key", async (req, res, next) => {
     try {
       const key = req.params.key;
-      const poll = livePages.pollLegacy(key, req.get("last-event-id"));
+      const poll = livePages.pollLegacy(key, req.get("last-event-id"), (catchUp) => pageSnapshot(key, catchUp));
       refreshIdleTimer();
-      const frames = poll.resync ? await pageSnapshot(key) : poll.events;
+      const { frames, cursor } = await poll;
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       let body = `retry: ${LEGACY_STREAM_RETRY_MS}\n\n`;
       for (const frame of frames) body += formatStreamEvent(frame.event, frame.data);
       // Pages ignore this event type; it carries the cursor the next reconnect sends back.
-      body += formatStreamEvent("lavish-cursor", {}, poll.cursor());
+      body += formatStreamEvent("lavish-cursor", {}, cursor);
       res.end(body);
     } catch (error) {
       next(error);

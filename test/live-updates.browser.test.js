@@ -11,6 +11,7 @@ process.env.LAVISH_AXI_HOST = "127.0.0.1";
 process.env.LAVISH_AXI_LINK_HOST = "127.0.0.1";
 
 const { serve } = await import("../src/server.js");
+const { LEGACY_PAGE_TTL_MS } = await import("../src/live-updates.js");
 
 // Chrome allows six HTTP/1.1 connections per host. When every review page held an EventSource,
 // a seventh tab on the same server stayed blank. This drives one headless Chrome with more pages
@@ -173,6 +174,17 @@ test(
       // pre-change chrome client, which holds an EventSource on /events/:key.
       chrome.onEvent((message) => {
         if (message.method !== "Fetch.requestPaused") return;
+        // An old page cut off from the server, as when its laptop sleeps.
+        if (message.params.request.url.includes("/events/")) {
+          chrome
+            .send(
+              "Fetch.failRequest",
+              { requestId: message.params.requestId, errorReason: "ConnectionRefused" },
+              message.sessionId,
+            )
+            .catch(() => {});
+          return;
+        }
         chrome
           .send(
             "Fetch.fulfillRequest",
@@ -317,6 +329,89 @@ test(
         },
         20_000,
         "every page reloads its artifact after an edit",
+      );
+
+      // An old page that cannot reach the server for longer than the server remembers it misses
+      // the receipt and the edit. When it comes back it still shows the receipt and reloads.
+      const oldPages = pages.filter((page) => page.legacy);
+      for (const page of oldPages) {
+        // The agent's reply ends the working state, so the page can send again.
+        await fetch(`${base}/api/${page.key}/agent-reply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: `done ${page.index}` }),
+        });
+      }
+      await waitFor(
+        async () => {
+          const states = await Promise.all(oldPages.map(pageState));
+          return states.every((state, i) => state?.chat.includes(`done ${oldPages[i].index}`)) || states;
+        },
+        20_000,
+        "every old page gets the agent's reply",
+      );
+      for (const page of oldPages) {
+        await evaluate(
+          page,
+          `(() => {
+            document.getElementById("chatInput").value = "second feedback from page ${page.index}";
+            document.getElementById("chatInput").dispatchEvent(new Event("input"));
+            document.getElementById("send").click();
+          })()`,
+        );
+      }
+      await waitFor(
+        async () => {
+          const states = await Promise.all(oldPages.map(pageState));
+          return states.every((state) => /Sent to Lavish/.test(state?.status || "")) || states;
+        },
+        20_000,
+        "every old page shows its feedback as sent",
+      );
+      const blockEvents = [{ urlPattern: "*/chrome-client.js" }, { urlPattern: "*/events/*" }];
+      for (const page of oldPages) {
+        await chrome.send("Fetch.enable", { patterns: blockEvents }, page.sessionId);
+      }
+      // Let any poll already in flight finish, so the events below happen while the pages are away.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const awayFrames = await Promise.all(oldPages.map(pageState));
+      for (const page of oldPages) {
+        const delivery = await (
+          await fetch(`${base}/api/poll?file=${encodeURIComponent(page.file)}&timeoutMs=0`)
+        ).json();
+        assert.equal(delivery.status, "feedback", JSON.stringify(delivery));
+        await fetch(`${base}/api/${page.key}/feedback-ack`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ feedback_id: delivery.feedback_id }),
+        });
+        await writeFile(page.file, `<!doctype html><html><body><h1>Edited while away ${page.index}</h1></body></html>`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, LEGACY_PAGE_TTL_MS + 2000));
+      const whileAway = await Promise.all(oldPages.map(pageState));
+      assert.deepEqual(
+        whileAway.map((state) => state?.frameSrc),
+        awayFrames.map((state) => state?.frameSrc),
+        "the pages did not see the edit while away",
+      );
+      for (const page of oldPages) {
+        await chrome.send("Fetch.enable", { patterns: [{ urlPattern: "*/chrome-client.js" }] }, page.sessionId);
+      }
+      await waitFor(
+        async () => {
+          const states = await Promise.all(oldPages.map(pageState));
+          const behind = oldPages.filter(
+            (_, i) => states[i]?.frameSrc === awayFrames[i]?.frameSrc || !/acknowledged/i.test(states[i]?.status || ""),
+          );
+          return (
+            behind.length === 0 || {
+              behind: behind.map((page) => page.index),
+              statuses: states.map((state) => state?.status),
+            }
+          );
+        },
+        20_000,
+        "every old page shows the receipt and reloads for the edit it missed",
       );
 
       // A server restart: socket pages reload once the new server is up; old pages reconnect.

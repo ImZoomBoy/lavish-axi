@@ -271,3 +271,123 @@ test("a polling page resyncs after a server restart", async () => {
     );
   });
 });
+
+/** Queues one prompt from the page, delivers it to the agent, and acknowledges it. */
+async function deliverAndAcknowledge(base, key, file) {
+  const queued = await fetch(`${base}/api/${key}/prompts`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ prompts: [{ prompt: "please fix", tag: "message" }] }),
+  });
+  assert.equal(queued.status, 200);
+  const delivery = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(file)}&timeoutMs=0`)).json();
+  assert.equal(delivery.status, "feedback");
+  const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ feedback_id: delivery.feedback_id }),
+  });
+  assert.equal(acknowledged.status, 200);
+  return delivery.feedback_id;
+}
+
+test("a polling page away across a server restart still gets the reload and the receipt it missed", async () => {
+  await withServer(async ({ openSession, restart, ...context }) => {
+    const { file, key } = await openSession();
+    const first = await pollLegacyStream(context.base, key);
+    const feedbackId = await deliverAndAcknowledge(context.base, key, file);
+    await restart();
+
+    const after = await pollLegacyStream(context.base, key, first.cursor);
+    assert.deepEqual(after.events.find((frame) => frame.event === "feedback-acknowledged")?.data, {
+      feedback_id: feedbackId,
+    });
+    assert.ok(
+      after.events.some((frame) => frame.event === "reload"),
+      "events from the old server run are gone, so the page reloads its artifact",
+    );
+
+    const caughtUp = await pollLegacyStream(context.base, key, after.cursor);
+    assert.deepEqual(
+      caughtUp.events.map((frame) => frame.event),
+      ["lavish-cursor"],
+      "the catch-up is sent once",
+    );
+    const fresh = await pollLegacyStream(context.base, key);
+    assert.deepEqual(
+      fresh.events.map((frame) => frame.event),
+      ["chat-sync", "agent-presence", "lavish-cursor"],
+      "a freshly loaded page has nothing to catch up on",
+    );
+  });
+});
+
+test("a polling page that stopped polling still gets the reload and the receipt it missed", async () => {
+  const realNow = Date.now;
+  let offset = 0;
+  Date.now = () => realNow() + offset;
+  try {
+    await withServer(async ({ base, openSession }) => {
+      const { file, key } = await openSession();
+      const first = await pollLegacyStream(base, key);
+      const feedbackId = await deliverAndAcknowledge(base, key, file);
+      const socketPage = connectLive(base, key);
+      await socketPage.opened;
+      await writeFile(file, "<!doctype html><html><body><p>edited</p></body></html>");
+      await socketPage.next("reload");
+      await socketPage.close();
+
+      // Long enough that the server forgets the page and drops the events it kept for it.
+      offset = LEGACY_PAGE_TTL_MS + 1000;
+      const after = await pollLegacyStream(base, key, first.cursor);
+      assert.ok(
+        after.events.some((frame) => frame.event === "chat-sync"),
+        "the page gets a snapshot",
+      );
+      assert.deepEqual(after.events.find((frame) => frame.event === "feedback-acknowledged")?.data, {
+        feedback_id: feedbackId,
+      });
+      assert.ok(
+        after.events.some((frame) => frame.event === "reload"),
+        "the page reloads for the edit it missed",
+      );
+    });
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test("an event raised while a polling page's snapshot is read is not lost", async () => {
+  const { SessionStore } = await import("../src/session-store.js");
+  const originalFindByKey = SessionStore.prototype.findByKey;
+  await withServer(async ({ base, openSession }) => {
+    const { key } = await openSession();
+    let armed = true;
+    SessionStore.prototype.findByKey = async function (sessionKey) {
+      const session = await originalFindByKey.call(this, sessionKey);
+      if (armed && sessionKey === key) {
+        armed = false;
+        // The reply is stored and announced after the snapshot has read state.
+        await postAgentReply(base, key, "during snapshot");
+      }
+      return session;
+    };
+    /** @type {Awaited<ReturnType<typeof pollLegacyStream>>} */
+    let first;
+    try {
+      first = await pollLegacyStream(base, key);
+    } finally {
+      SessionStore.prototype.findByKey = originalFindByKey;
+    }
+    const second = await pollLegacyStream(base, key, first.cursor);
+
+    const seen = [first, second].flatMap((poll) =>
+      poll.events.flatMap((frame) => {
+        if (frame.event === "chat-sync") return frame.data.chat.map((item) => item.text);
+        if (frame.event === "agent-reply") return [frame.data.text];
+        return [];
+      }),
+    );
+    assert.deepEqual(seen, ["during snapshot"], "the page sees the reply exactly once");
+  });
+});
