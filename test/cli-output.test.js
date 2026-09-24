@@ -32,6 +32,7 @@ import {
   fetchPollJson,
   getCommandHelp,
   normalizeArgv,
+  POLL_BEFORE_TURN_END_RULE,
   pollInterruptedText,
   pollWaitBannerText,
   pollWaitTickText,
@@ -43,7 +44,6 @@ import {
   shouldKillProcessOnPort,
   shouldNarratePollWaitTicks,
   shouldOpenBrowser,
-  serverHasLiveWork,
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
@@ -1193,6 +1193,52 @@ test("feedback next step keeps the next poll completion observable", () => {
   assert.match(output.next_step, /queued feedback is never lost/);
   assert.match(output.next_step, /Do not respond to the user just yet\. First run/);
   assert.doesNotMatch(output.next_step, /above 10 minutes/);
+});
+
+test("home output poll help tells the agent to start the poll before ending its turn", () => {
+  for (const agent of ["generic", "claude", "codex"]) {
+    const output = createHomeOutput({ bin: "lavish-axi", sessions: [], agent });
+    const pollHelp = output.help.find((item) => item.startsWith("Run `lavish-axi poll <html-file>`"));
+    assert.ok(pollHelp, "home output has a poll help item");
+    assert.ok(pollHelp.includes(POLL_BEFORE_TURN_END_RULE), `${agent} poll help carries the turn-end rule`);
+  }
+});
+
+test("feedback without a feedback_id never tells the agent to ack", () => {
+  const responses = [
+    { status: "feedback", dom_snapshot: "", prompts: [{ prompt: "Make it blue", tag: "message" }] },
+    { status: "feedback", dom_snapshot: "", prompts: [], session_ended: true, ended_by: "user" },
+    { status: "feedback", dom_snapshot: "", prompts: [], session_ended: true, ended_by: "agent" },
+    {
+      status: "feedback",
+      dom_snapshot: "",
+      prompts: [],
+      artifact_failures: [{ kind: "artifact-unavailable", detail: "404" }],
+    },
+  ];
+  for (const response of responses) {
+    const output = createPollOutput({ file: "/tmp/report.html", response });
+    assert.equal("feedback_id" in output.session, false);
+    assert.doesNotMatch(output.next_step, /feedback_id/, output.next_step);
+    assert.doesNotMatch(output.next_step, /\back\b/i, output.next_step);
+    assert.doesNotMatch(output.next_step, /receipt/, output.next_step);
+  }
+  const output = createPollOutput({ file: "/tmp/report.html", response: responses[0] });
+  assert.match(
+    output.next_step,
+    /Do not respond to the user just yet\. Run `lavish-axi poll \/tmp\/report\.html --agent-reply/,
+  );
+});
+
+test("feedback with a feedback_id tells the agent to ack that batch", () => {
+  for (const extra of [{}, { session_ended: true, ended_by: "user" }, { session_ended: true, ended_by: "agent" }]) {
+    const output = createPollOutput({
+      file: "/tmp/report.html",
+      response: { status: "feedback", feedback_id: "feedback-7", dom_snapshot: "", prompts: [], ...extra },
+    });
+    assert.match(output.next_step, /`lavish-axi ack \/tmp\/report\.html feedback-7`/);
+    assert.match(output.next_step, /receipt\.status: "delivered"/);
+  }
 });
 
 test("feedback next step is Codex-aware when requested", () => {
@@ -2602,17 +2648,6 @@ test("fetchPollJson stops reconnecting to a server that keeps cutting the poll",
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
-});
-
-test("serverHasLiveWork keeps servers with live work or no live report", () => {
-  const health = (live) => ({ ok: true, app: "lavish-axi", version: "0.1.4", ...(live ? { live } : {}) });
-  assert.equal(serverHasLiveWork(health({ polls: 1, pages: 0 })), true);
-  assert.equal(serverHasLiveWork(health({ polls: 0, pages: 2 })), true);
-  assert.equal(serverHasLiveWork(health({ polls: 0, pages: 0 })), false);
-  assert.equal(serverHasLiveWork(health(null)), true, "an older server that cannot report counts as live");
-  assert.equal(serverHasLiveWork({ ok: true }), false, "pre-handshake servers are still replaced");
-  assert.equal(serverHasLiveWork({ ok: true, app: "other", version: "1.0.0" }), false);
-  assert.equal(serverHasLiveWork(null), false);
 });
 
 test("stop command shuts down the running server on the configured port", async () => {
