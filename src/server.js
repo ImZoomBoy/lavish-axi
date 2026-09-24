@@ -192,8 +192,12 @@ export async function serve({
     isWhiteboardWriteApiPath(req.path) ? whiteboardJsonParser(req, res, next) : defaultJsonParser(req, res, next),
   );
 
+  // `live` lets a CLI of another version see that replacing this server would cut waiting
+  // polls or open review pages, so it can keep the server instead of shutting it down.
   app.get("/health", (req, res) => {
-    res.json({ ok: true, app: "lavish-axi", version });
+    let polls = 0;
+    for (const count of activePolls.values()) polls += count;
+    res.json({ ok: true, app: "lavish-axi", version, live: { polls, pages: sseClients.size } });
   });
 
   let shutdownResolve;

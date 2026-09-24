@@ -42,6 +42,7 @@ import {
   shouldKillProcessOnPort,
   shouldNarratePollWaitTicks,
   shouldOpenBrowser,
+  serverHasLiveWork,
   shouldRestartServer,
   startPollWaitReporter,
   stopCommand,
@@ -223,7 +224,7 @@ test("open output flags an artifact that never paints its own page surface", () 
     status: "opened",
   });
   assert.equal("self_paint_warning" in clean, false);
-  assert.match(clean.next_step, /^Do not respond to the user just yet\./);
+  assert.match(clean.next_step, /^Now you must run `lavish-axi poll \/tmp\/artifact\.html`/);
 });
 
 test("export and share outputs flag an unpainted page surface before it reaches a host", () => {
@@ -751,7 +752,7 @@ test("open output keeps the user URL in session data and next_step focused on po
   // reopen etiquette. Sentence-level phrasing is free to change without touching this test.
   assert.doesNotMatch(output.next_step, /Tell the user (?:to open|to visit)/i);
   assert.doesNotMatch(output.next_step, /http:\/\/localhost:4387\/session\/abc123/);
-  assert.match(output.next_step, /Do not respond to the user just yet\. Now you must run/);
+  assert.match(output.next_step, /^Now you must run/);
   assert.match(output.next_step, /lavish-axi poll \/tmp\/artifact\.html/);
   assert.match(output.next_step, /Layout issues inbox/);
   assert.doesNotMatch(output.next_step, /layout_warnings/);
@@ -762,6 +763,47 @@ test("open output keeps the user URL in session data and next_step focused on po
   assert.match(output.next_step, /Do not pass --timeout-ms/);
   assert.match(output.next_step, /If the user ends the session, stop polling and do not reopen it/);
   assert.match(output.next_step, /--reopen/);
+});
+
+test("open output leads with the poll command so a truncated read still shows it", () => {
+  const output = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+    status: "launch-requested",
+    selfPaintWarning: SELF_PAINT_WARNING,
+  });
+
+  assert.deepEqual(Object.keys(output), ["poll_command", "next_step", "self_paint_warning", "session"]);
+  assert.equal(output.poll_command, "lavish-axi poll /tmp/artifact.html");
+});
+
+test("open output reports the browser launch as requested and asks for the session URL as a link", () => {
+  const launched = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+    status: "launch-requested",
+  });
+  assert.equal(launched.session.status, "launch-requested");
+  assert.match(launched.next_step, /asked the system to open the review page/);
+  assert.match(launched.next_step, /cannot confirm the page loaded/);
+  assert.match(launched.next_step, /session URL from `session\.url` as a clickable link/);
+  assert.match(launched.next_step, /do not say the page is open/);
+
+  const notLaunched = createOpenOutput({
+    file: "/tmp/artifact.html",
+    url: "http://localhost:4387/session/abc123",
+    status: "ready",
+  });
+  assert.match(notLaunched.next_step, /did not open a browser/);
+  assert.match(notLaunched.next_step, /session URL from `session\.url` as a clickable link/);
+});
+
+test("poll wake-path guidance names Claude's run_in_background as completion-aware", () => {
+  const output = createOpenOutput({ file: "/tmp/artifact.html", url: "u", status: "ready" });
+  for (const text of [output.next_step, getCommandHelp("poll"), createSkillMarkdown()]) {
+    assert.match(text, /Claude's `run_in_background` is such a completion-aware facility/);
+    assert.match(text, /T3 Code thread or a Claude desktop session/);
+  }
 });
 
 test("open output gives Codex the shared wake-path contract plus an attached-turn warning", () => {
@@ -1574,6 +1616,159 @@ test("spawned poll delivers a feedback batch and the ack command confirms proces
   }
 });
 
+function spawnCli(args, env) {
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), ...args], {
+    cwd: fileURLToPath(new URL("..", import.meta.url)),
+    env,
+  });
+  const output = { stdout: "", stderr: "" };
+  child.stdout.on("data", (chunk) => {
+    output.stdout += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    output.stderr += chunk.toString();
+  });
+  const closed = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => resolve({ code, signal }));
+  });
+  return { child, output, closed };
+}
+
+// Pooled keep-alive sockets to a closed server fail with ECONNRESET, so retry until the
+// replacement server answers the presence stream.
+async function waitForPollListeningOnNewServer(base, key, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      await waitForPollListening(base, key, Math.max(1, deadline - Date.now()));
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out: ${label}`)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// A CLI of another version may have replaced the test server with a detached one on the
+// same port. Stop that one so no stray server outlives the test.
+async function stopForeignServer(base, version) {
+  try {
+    const health = await (await fetch(`${base}/health`)).json();
+    if (health.version !== version) await fetch(`${base}/shutdown`, { method: "POST" });
+  } catch {
+    // Nothing is listening.
+  }
+}
+
+test("a CLI of another version keeps the server while it holds a waiting poll", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-version-swap-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  const server = await serve({ port: 0, stateFile: `${stateDir}/state.json`, version: VERSION });
+  const base = `http://127.0.0.1:${server.port}`;
+  const env = {
+    ...process.env,
+    LAVISH_AXI_STATE_DIR: stateDir,
+    LAVISH_AXI_PORT: String(server.port),
+    LAVISH_AXI_NO_OPEN: "1",
+  };
+  let poll = null;
+  try {
+    const sessionResponse = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await sessionResponse.json();
+
+    poll = spawnCli(["poll", artifact], env);
+    await waitForPollListening(base, key);
+
+    const other = spawnCli(["poll", artifact, "--timeout-ms", "200"], {
+      ...env,
+      LAVISH_AXI_BUILD_VERSION: "0.0.0-other-version-test",
+    });
+    const otherResult = await withTimeout(other.closed, 20_000, "other-version CLI");
+    // Give a cut poll time to exit before checking that it is still waiting.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(poll.child.exitCode, null, `the waiting poll is still waiting: ${poll.output.stdout}`);
+    const health = await (await fetch(`${base}/health`)).json();
+    assert.equal(health.version, VERSION, "the running server was kept");
+    assert.equal(otherResult.code, 0, other.output.stderr);
+    assert.match(other.output.stderr, /live/);
+
+    await fetch(`${base}/api/${key}/end`, { method: "POST" });
+    const pollResult = await withTimeout(poll.closed, 20_000, "waiting poll");
+    assert.equal(pollResult.code, 0, poll.output.stderr);
+    assert.match(poll.output.stdout, /ended/);
+  } finally {
+    poll?.child.kill();
+    await stopForeignServer(base, VERSION);
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
+test("spawned poll reconnects when its connection is cut and still delivers feedback", async () => {
+  const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-poll-reconnect-test-`);
+  const artifact = `${stateDir}/artifact.html`;
+  const stateFilePath = `${stateDir}/state.json`;
+  await writeFile(artifact, "<html><body>hello</body></html>", "utf8");
+  let server = await serve({ port: 0, stateFile: stateFilePath, version: VERSION });
+  const port = server.port;
+  const base = `http://127.0.0.1:${port}`;
+  let poll = null;
+  try {
+    const sessionResponse = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await sessionResponse.json();
+
+    poll = spawnCli(["poll", artifact], {
+      ...process.env,
+      LAVISH_AXI_STATE_DIR: stateDir,
+      LAVISH_AXI_PORT: String(port),
+    });
+    await waitForPollListening(base, key);
+
+    // Closing the server cuts the waiting poll's connection, as a version swap does.
+    await server.close();
+    server = await serve({ port, stateFile: stateFilePath, version: VERSION });
+    const outcome = await Promise.race([
+      poll.closed.then((exit) => ({ exit })),
+      waitForPollListeningOnNewServer(base, key).then(() => ({ listening: true })),
+    ]);
+    assert.ok("listening" in outcome, `the poll exited instead of reconnecting: ${poll.output.stdout}`);
+
+    await fetch(`${base}/api/${key}/prompts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompts: [{ prompt: "Make it warmer", selector: "body", tag: "body", text: "hello" }] }),
+    });
+    const result = await withTimeout(poll.closed, 20_000, "reconnected poll");
+    assert.equal(result.code, 0, poll.output.stderr);
+    assert.match(poll.output.stdout, /Make it warmer/);
+    assert.match(poll.output.stderr, /reconnect/i);
+  } finally {
+    poll?.child.kill();
+    await server.close();
+    await rm(stateDir, { force: true, recursive: true, maxRetries: 5, retryDelay: 200 });
+  }
+});
+
 test("waiting next step reassures agents that re-running poll loses nothing", () => {
   const output = createPollOutput({
     file: "/tmp/report.html",
@@ -2269,6 +2464,72 @@ test("fetchJson reports interrupted response body failures without retrying", as
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test("fetchJson ends a reconnecting poll with a clear error when the server is gone for good", async () => {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    requests += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write(" ");
+    // Cut the waiting poll, then stop listening for good.
+    setImmediate(() => {
+      res.socket?.destroy();
+      server.close();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
+  let reconnects = 0;
+  await assert.rejects(
+    () =>
+      fetchJson(`http://127.0.0.1:${address.port}/api/poll`, {
+        retryDelayMs: 20,
+        reconnectWindowMs: 300,
+        onReconnect: () => {
+          reconnects += 1;
+        },
+      }),
+    (error) => {
+      assert.ok(error instanceof AxiError);
+      assert.equal(error.code, "SERVER_ERROR");
+      assert.match(error.message, /did not come back within \d+s after the poll connection was cut/);
+      return true;
+    },
+  );
+  assert.equal(requests, 1);
+  assert.equal(reconnects, 1);
+});
+
+test("fetchJson stops reconnecting to a server that keeps cutting the poll", async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write(" ");
+    setImmediate(() => res.socket?.destroy());
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind to a TCP port");
+    await assert.rejects(
+      () => fetchJson(`http://127.0.0.1:${address.port}/api/poll`, { retryDelayMs: 20, reconnectWindowMs: 300 }),
+      /did not come back/,
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("serverHasLiveWork keeps servers with live work or no live report", () => {
+  const health = (live) => ({ ok: true, app: "lavish-axi", version: "0.1.4", ...(live ? { live } : {}) });
+  assert.equal(serverHasLiveWork(health({ polls: 1, pages: 0 })), true);
+  assert.equal(serverHasLiveWork(health({ polls: 0, pages: 2 })), true);
+  assert.equal(serverHasLiveWork(health({ polls: 0, pages: 0 })), false);
+  assert.equal(serverHasLiveWork(health(null)), true, "an older server that cannot report counts as live");
+  assert.equal(serverHasLiveWork({ ok: true }), false, "pre-handshake servers are still replaced");
+  assert.equal(serverHasLiveWork({ ok: true, app: "other", version: "1.0.0" }), false);
+  assert.equal(serverHasLiveWork(null), false);
 });
 
 test("stop command shuts down the running server on the configured port", async () => {
