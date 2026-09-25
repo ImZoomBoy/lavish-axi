@@ -107,6 +107,18 @@ test("server serves chrome browser behavior from a dedicated source file", async
   assert.doesNotMatch(html, /<script>\s*const key=/);
 });
 
+test("chrome page carries a hidden quiet banner that names the timeout", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  assert.match(
+    html,
+    /<div class="presence-banner" id="quietBanner" hidden>Your agent has not checked back for 2 minutes\. You can keep sending\. It gets everything on its next check\.<\/div>/,
+  );
+  assert.match(
+    createChromeHtml({ key: "abc", file: "/tmp/artifact.html" }, { agentQuietAfterMs: 90_000 }),
+    /not checked back for 90 seconds\./,
+  );
+});
+
 test("server serves chrome styles from a dedicated source file", async () => {
   const source = await readFile(new URL("../src/server.js", import.meta.url), "utf8");
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });

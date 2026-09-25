@@ -50,6 +50,7 @@ const copyPathButton = /** @type {HTMLButtonElement} */ (document.getElementById
 const copyHint = /** @type {HTMLSpanElement} */ (document.getElementById("copyHint"));
 const copyHintText = /** @type {HTMLSpanElement} */ (document.getElementById("copyHintText"));
 const presenceBanner = /** @type {HTMLDivElement} */ (document.getElementById("presenceBanner"));
+const quietBanner = /** @type {HTMLDivElement} */ (document.getElementById("quietBanner"));
 const handoffBanner = /** @type {HTMLDivElement} */ (document.getElementById("handoffBanner"));
 const handoffTakeoverButton = /** @type {HTMLButtonElement} */ (document.getElementById("handoffTakeover"));
 const endedOverlay = /** @type {HTMLDivElement} */ (document.getElementById("endedOverlay"));
@@ -339,7 +340,7 @@ function syncChat(chat) {
 }
 
 function setAgentPresence(state) {
-  agentPresence = state === "listening" || state === "working" ? state : "waiting";
+  agentPresence = state === "listening" || state === "working" || state === "quiet" ? state : "waiting";
   updateSendState();
   syncPresenceBanner();
 
@@ -999,6 +1000,9 @@ async function endSession() {
 }
 
 function syncPresenceBanner() {
+  // "quiet" is the server saying the agent took a batch and has not polled since. It already
+  // waited out its own timeout, so its banner shows at once.
+  if (quietBanner) quietBanner.hidden = ended || agentPresence !== "quiet";
   if (!presenceBanner) return;
   if (ended || agentPresence !== "waiting") {
     if (presenceBannerTimer) clearTimeout(presenceBannerTimer);
