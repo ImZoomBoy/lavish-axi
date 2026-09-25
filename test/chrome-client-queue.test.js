@@ -2408,6 +2408,34 @@ test("presence banner restarts its 20 seconds when waiting is broken", async () 
   assert.equal(banner.hidden, false);
 });
 
+test("a quiet agent reopens sending and shows the quiet banner at once", async () => {
+  const chrome = await createChromeHarness();
+  const waitingBanner = chrome.element("presenceBanner");
+  const quietBanner = chrome.element("quietBanner");
+  quietBanner.hidden = true;
+  const presence = chrome.liveListener("agent-presence");
+
+  presence({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(chrome.element("send").disabled, true, "sending waits while the agent works");
+
+  presence({ data: JSON.stringify({ state: "quiet" }) });
+  assert.equal(chrome.element("send").disabled, false, "sending opens once the agent goes quiet");
+  assert.equal(chrome.element("sendAndEnd").disabled, false);
+  assert.equal(quietBanner.hidden, false, "the quiet banner shows without the waiting delay");
+  assert.equal(waitingBanner.hidden, true, "only one banner shows");
+  assert.equal(
+    chrome.element("chatLog").children.some((child) => /agent-working/.test(child.className)),
+    false,
+    "the Working bubble goes away",
+  );
+  chrome.runTimers(20000);
+  assert.equal(waitingBanner.hidden, true, "the waiting banner does not stack on top");
+
+  presence({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(quietBanner.hidden, true, "a poll attaching restores the normal state");
+  assert.equal(chrome.element("send").disabled, false);
+});
+
 test("presence banner stays hidden when the session ends during the wait", async () => {
   const chrome = await createChromeHarness();
   const banner = chrome.element("presenceBanner");

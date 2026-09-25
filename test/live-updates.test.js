@@ -391,3 +391,68 @@ test("an event raised while a polling page's snapshot is read is not lost", asyn
     assert.deepEqual(seen, ["during snapshot"], "the page sees the reply exactly once");
   });
 });
+
+test("a working session goes quiet when no poll comes back, and every page agrees", async () => {
+  await withServer(
+    async ({ base, openSession }) => {
+      const { file, key } = await openSession();
+      const live = connectLive(base, key);
+      await live.opened;
+      assert.deepEqual(await live.next("agent-presence"), { state: "waiting" });
+      const legacy = await pollLegacyStream(base, key);
+
+      const postPrompt = (prompt) =>
+        fetch(`${base}/api/${key}/prompts`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ prompts: [{ prompt, tag: "message" }] }),
+        });
+      const pollUrl = `${base}/api/poll?file=${encodeURIComponent(file)}`;
+
+      await postPrompt("first");
+      const first = await (await fetch(pollUrl)).json();
+      assert.equal(first.status, "feedback");
+      assert.deepEqual(await live.next("agent-presence"), { state: "working" });
+      const ack = await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: first.feedback_id }),
+      });
+      assert.equal(ack.status, 200);
+
+      // No poll comes back, so the page stops waiting on the agent.
+      assert.deepEqual(await live.next("agent-presence", 3000), { state: "quiet" });
+
+      const late = connectLive(base, key);
+      await late.opened;
+      assert.deepEqual(await late.next("agent-presence"), { state: "quiet" }, "a page opened later agrees");
+      const legacyUpdate = await pollLegacyStream(base, key, legacy.cursor);
+      assert.deepEqual(
+        legacyUpdate.events.filter((frame) => frame.event === "agent-presence").map((frame) => frame.data.state),
+        ["working", "quiet"],
+        "a polling page agrees",
+      );
+
+      // Feedback sent while quiet is kept and reaches the agent on its next poll.
+      assert.equal((await postPrompt("sent while quiet")).status, 200);
+      const next = await (await fetch(pollUrl)).json();
+      assert.equal(next.status, "feedback");
+      assert.match(JSON.stringify(next), /sent while quiet/);
+      await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: next.feedback_id }),
+      });
+      assert.deepEqual(await live.next("agent-presence"), { state: "working" });
+      assert.deepEqual(await live.next("agent-presence", 3000), { state: "quiet" }, "each delivery restarts the clock");
+
+      // A poll attaching restores the normal state.
+      const waiting = fetch(`${pollUrl}&timeoutMs=200`).then((res) => res.json());
+      assert.deepEqual(await live.next("agent-presence"), { state: "listening" });
+      await waiting;
+      await late.close();
+      await live.close();
+    },
+    { agentQuietAfterMs: 400 },
+  );
+});

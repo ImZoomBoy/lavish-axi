@@ -26,6 +26,7 @@ import {
   resolveDiagnosticViewportClasses,
   serializeLayoutWarnings,
 } from "./layout-warnings.js";
+import { AGENT_QUIET_AFTER_MS, createAgentPresence } from "./agent-presence.js";
 import * as mermaidNode from "./mermaid-node.js";
 import { extractMermaidSources, mermaidSourceHash } from "./mermaid-source.js";
 import {
@@ -139,6 +140,7 @@ export async function serve({
   linkHost: linkHostName = linkHost(),
   allowedHosts = extraAllowedHosts(),
   whiteboardAssetsDir = defaultWhiteboardAssetsDir(),
+  agentQuietAfterMs = AGENT_QUIET_AFTER_MS,
 }) {
   // Loaded here, not at the top: the CLI imports this module, and `--version` must stay fast.
   const { WebSocketServer } = await import("ws");
@@ -146,8 +148,18 @@ export async function serve({
   const store = new SessionStore(stateFile);
   const events = new EventEmitter();
   const watchers = new Map();
-  const activePolls = new Map();
-  const deliveredFeedback = new Set();
+  const presence = createAgentPresence(events, { quietAfterMs: agentQuietAfterMs });
+  // Delivery, not the ack, starts "working": the guidance puts the ack after the agent has applied
+  // the batch, so waiting for it left the page reading "waiting" for the whole working period.
+  // The ack stays the durable receipt that clears inflight_feedback.
+  /**
+   * @param {string} key
+   * @param {string} feedbackId
+   */
+  function markFeedbackDelivered(key, feedbackId) {
+    if (feedbackId) events.emit("feedback-delivered", key, feedbackId);
+    presence.markWorking(key);
+  }
   const livePages = createLivePages(events);
   const whiteboardChannelSecret = crypto.randomBytes(32);
   // Sessions with at least one warning the user queued that has not been re-checked yet.
@@ -200,9 +212,7 @@ export async function serve({
   // `live` lets a CLI of another version see that replacing this server would cut waiting
   // polls or open review pages, so it can keep the server instead of shutting it down.
   app.get("/health", (req, res) => {
-    let polls = 0;
-    for (const count of activePolls.values()) polls += count;
-    res.json({ ok: true, app: "lavish-axi", version, live: { polls, pages: livePages.count() } });
+    res.json({ ok: true, app: "lavish-axi", version, live: { polls: presence.pollCount(), pages: livePages.count() } });
   });
 
   let shutdownResolve;
@@ -236,7 +246,7 @@ export async function serve({
       const url = shouldDisableLayoutGateOpen(req.body || {}) ? appendNoGateParam(sessionUrl) : sessionUrl;
       const session = await store.upsertSession(file, sessionUrl);
       if (existing?.status === "ended") {
-        clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+        presence.clear(key);
       }
       logEvent?.(`session opened key=${key} file=${file}`);
       await syncOutstandingRepairs(key);
@@ -256,13 +266,7 @@ export async function serve({
       const immediate = await store.takeFeedback(key);
       if (immediate.status !== "waiting") {
         if (immediate.status === "feedback") {
-          markFeedbackDelivered(
-            key,
-            activePolls,
-            deliveredFeedback,
-            events,
-            "feedback_id" in immediate ? immediate.feedback_id : "",
-          );
+          markFeedbackDelivered(key, "feedback_id" in immediate ? immediate.feedback_id : "");
         }
         res.json(immediate);
         return;
@@ -277,7 +281,7 @@ export async function serve({
         }, pollHeartbeatMs);
         heartbeat.unref?.();
       }
-      setPollActive(key, activePolls, deliveredFeedback, events, true);
+      presence.pollAttached(key);
       refreshIdleTimer();
       const timer = timeoutMs === null ? null : setTimeout(() => respond().catch(handleRespondError), timeoutMs);
       let cleaned = false;
@@ -289,7 +293,7 @@ export async function serve({
         if (heartbeat) clearInterval(heartbeat);
         events.off("feedback", onFeedback);
         events.off("ended", onFeedback);
-        setPollActive(key, activePolls, deliveredFeedback, events, false);
+        presence.pollReleased(key);
         refreshIdleTimer();
       };
       const respond = async () => {
@@ -298,13 +302,7 @@ export async function serve({
         try {
           const result = await store.takeFeedback(key);
           if (result.status === "feedback") {
-            markFeedbackDelivered(
-              key,
-              activePolls,
-              deliveredFeedback,
-              events,
-              "feedback_id" in result ? result.feedback_id : "",
-            );
+            markFeedbackDelivered(key, "feedback_id" in result ? result.feedback_id : "");
           }
           if (streamHeartbeat) {
             res.end(JSON.stringify(result));
@@ -357,7 +355,7 @@ export async function serve({
         });
         return;
       }
-      if (shouldEndSession) clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      if (shouldEndSession) presence.clear(req.params.key);
       if (hasLayoutWarningPrompt) {
         await syncOutstandingRepairs(req.params.key);
         events.emit("layout-warnings", req.params.key, serializeLayoutWarnings(session.layout_warnings));
@@ -382,11 +380,8 @@ export async function serve({
         res.status(409).json(result);
         return;
       }
-      if (result.status === "acknowledged") {
-        markFeedbackAcknowledged(req.params.key, activePolls, deliveredFeedback, events, result.feedback_id);
-      } else {
-        events.emit("feedback-acknowledged", req.params.key, result.feedback_id);
-      }
+      events.emit("feedback-acknowledged", req.params.key, result.feedback_id);
+      if (result.status === "acknowledged") presence.markWorking(req.params.key);
       res.json(result);
     } catch (error) {
       next(error);
@@ -487,7 +482,7 @@ export async function serve({
   app.post("/api/:key/end", async (req, res, next) => {
     try {
       await store.endSession(req.params.key, "user");
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      presence.clear(req.params.key);
       events.emit("ended", req.params.key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
@@ -509,7 +504,7 @@ export async function serve({
       // drains feedback and then releases leaves presence stuck on "working" — the chrome keeps
       // Send disabled — until some future poll happens to attach, even though the agent already
       // answered. See "live agent-presence returns to waiting after an agent reply".
-      clearFeedbackDelivery(req.params.key, activePolls, deliveredFeedback, events);
+      presence.clear(req.params.key);
       res.json({ status: "sent" });
     } catch (error) {
       next(error);
@@ -593,7 +588,7 @@ export async function serve({
       const file = await canonicalFile(req.body.file);
       const key = sessionKey(file);
       await store.endSession(key, "agent");
-      clearFeedbackDelivery(key, activePolls, deliveredFeedback, events);
+      presence.clear(key);
       events.emit("ended", key);
       res.json({ status: "ended" });
       await shutdownIfNoLiveSessions();
@@ -622,6 +617,7 @@ export async function serve({
           artifactLoadToken: chromeLoad.artifact_load_token,
           artifactLoadSequence: chromeLoad.artifact_load_sequence,
           chromeLoadToken: chromeLoad.chrome_load_token,
+          agentQuietAfterMs,
         }),
       );
     } catch (error) {
@@ -745,7 +741,7 @@ export async function serve({
     /** @type {Array<{ event: string, data: unknown }>} */
     const snapshot = [
       { event: "chat-sync", data: { chat: session?.chat || [] } },
-      { event: "agent-presence", data: { state: computePresence(key, activePolls, deliveredFeedback) } },
+      { event: "agent-presence", data: { state: presence.state(key) } },
     ];
     const stored = session?.acknowledged_feedback;
     const storedIsNewer =
@@ -1072,6 +1068,7 @@ export async function serve({
       clearTimeout(idleTimer);
       idleTimer = null;
     }
+    presence.close();
     // Tell open browser chromes to reload before we drop their live socket. The new server
     // adopts the session via state.json once it binds, so the reloaded chrome immediately gets
     // the upgraded HTML/CSS/JS. Polling pages from older builds just reconnect to the new server.
@@ -1104,11 +1101,11 @@ export async function serve({
     if (shuttingDown || idleTimeoutMs == null) return;
     // Polling pages hold no connection, so they cannot re-arm the timer when they go away.
     // The timer is armed without them and re-checks them when it fires.
-    if (livePages.socketCount() > 0 || activePolls.size > 0) return;
+    if (livePages.socketCount() > 0 || presence.pollCount() > 0) return;
     idleTimer = setTimeout(() => {
       idleTimer = null;
       if (shuttingDown) return;
-      if (livePages.count() > 0 || activePolls.size > 0) {
+      if (livePages.count() > 0 || presence.pollCount() > 0) {
         refreshIdleTimer();
         return;
       }
@@ -1124,7 +1121,7 @@ export async function serve({
   // idle timer reap it once those connections drop. Best-effort: never let a read failure
   // block the end response.
   async function shutdownIfNoLiveSessions() {
-    if (livePages.count() > 0 || activePolls.size > 0) return;
+    if (livePages.count() > 0 || presence.pollCount() > 0) return;
     try {
       const sessions = await store.listSessions();
       if (sessions.every((session) => session.status === "ended")) {
@@ -1403,58 +1400,6 @@ export function hasLiveReloadRootOptIn(html) {
   return /<meta\b(?=[^>]*name=["']lavish-live-reload["'])(?=[^>]*content=["']root["'])[^>]*>/i.test(searchableHtml);
 }
 
-function setPollActive(key, activePolls, deliveredFeedback, events, active) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  const count = activePolls.get(key) || 0;
-  const nextCount = active ? count + 1 : Math.max(0, count - 1);
-  if (nextCount === count) return;
-  if (nextCount === 0) {
-    activePolls.delete(key);
-  } else {
-    activePolls.set(key, nextCount);
-    deliveredFeedback.delete(key);
-  }
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) events.emit("agent-presence", key, nextPresence);
-}
-
-// Delivery, not the ack, starts "working": the guidance puts the ack after the agent has applied
-// the batch, so waiting for it left the page reading "waiting" for the whole working period.
-// The ack stays the durable receipt that clears inflight_feedback.
-function markFeedbackDelivered(key, activePolls, deliveredFeedback, events, feedbackId = "") {
-  if (feedbackId) events.emit("feedback-delivered", key, feedbackId);
-  markFeedbackWorking(key, activePolls, deliveredFeedback, events);
-}
-
-function markFeedbackAcknowledged(key, activePolls, deliveredFeedback, events, feedbackId = "") {
-  if (feedbackId) events.emit("feedback-acknowledged", key, feedbackId);
-  markFeedbackWorking(key, activePolls, deliveredFeedback, events);
-}
-
-function markFeedbackWorking(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  deliveredFeedback.add(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
-  }
-}
-
-function clearFeedbackDelivery(key, activePolls, deliveredFeedback, events) {
-  const previousPresence = computePresence(key, activePolls, deliveredFeedback);
-  deliveredFeedback.delete(key);
-  const nextPresence = computePresence(key, activePolls, deliveredFeedback);
-  if (nextPresence !== previousPresence) {
-    events.emit("agent-presence", key, nextPresence);
-  }
-}
-
-export function computePresence(key, activePolls, deliveredFeedback) {
-  if (activePolls.has(key)) return "listening";
-  if (deliveredFeedback.has(key)) return "working";
-  return "waiting";
-}
-
 function chromeIcon(paths, size = 16, strokeWidth = 1.7) {
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
 }
@@ -1596,6 +1541,15 @@ export function extractArtifactHead(html) {
   return { faviconTag, title };
 }
 
+/** @param {number} ms */
+export function agentQuietMessage(ms) {
+  const minutes = ms / 60_000;
+  const span = Number.isInteger(minutes)
+    ? `${minutes} minute${minutes === 1 ? "" : "s"}`
+    : `${Math.round(ms / 1000)} seconds`;
+  return `Your agent has not checked back for ${span}. You can keep sending. It gets everything on its next check.`;
+}
+
 export function createChromeHtml(
   session,
   {
@@ -1606,6 +1560,7 @@ export function createChromeHtml(
     artifactLoadToken = "",
     artifactLoadSequence = 0,
     chromeLoadToken = "",
+    agentQuietAfterMs = AGENT_QUIET_AFTER_MS,
   } = {},
 ) {
   const sessionJson = jsonScript({
@@ -1638,7 +1593,7 @@ ${faviconTag}
 </head>
 <body class="${bodyClass}">
 <div class="bar"><div class="brand"><span class="brand-mark">Lavish</span><span class="brand-support">Editor</span></div><div class="spacer" aria-hidden="true"></div><div class="warnings-wrap" id="warningsWrap" hidden><button class="warnings-button" id="warningsButton" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="warningsDrawer">${chromeIcons.warning}<span class="warnings-count" id="warningsCount">0</span></button><div class="menu warnings-drawer" id="warningsDrawer" role="dialog" aria-labelledby="warningsTitle" aria-describedby="warningsSummary" hidden><div class="warnings-head"><h2 class="warnings-title" id="warningsTitle">Layout issues</h2><p class="warnings-summary" id="warningsSummary"></p></div><div class="warnings-toolbar"><label class="warnings-selectall"><input type="checkbox" id="warningsSelectAll"><span>Select all</span></label><span class="warnings-selected" id="warningsSelected" role="status" aria-live="polite"></span></div><div class="warnings-list" id="warningsList"></div><div class="warnings-foot"><p class="warnings-note">Queueing sends a repair request with your next feedback. An issue is marked resolved only after a newer artifact load and a complete check at the same viewport no longer finds it.</p><button class="button" id="warningsQueueButton" type="button" disabled>Queue selected fixes</button></div></div></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
-<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not checking for feedback right now. Anything you send is kept and reaches it on its next check.</div><div class="feedback-status" id="feedbackStatus" role="status" aria-live="polite" hidden></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
+<div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe></div><aside class="panel"><h2>Conversation</h2><div class="panel-scroll" id="panelScroll"><div class="chat" id="chatLog"></div><div class="annotation-pills" id="annotationPills"></div></div><div class="composer"><div class="presence-banner handoff-banner" id="handoffBanner" hidden><span>This review is open in another Lavish tab.</span><button class="handoff-takeover" id="handoffTakeover" type="button">Take over here</button></div><div class="presence-banner" id="presenceBanner" hidden>Your agent is not checking for feedback right now. Anything you send is kept and reaches it on its next check.</div><div class="presence-banner" id="quietBanner" hidden>${escapeHtml(agentQuietMessage(agentQuietAfterMs))}</div><div class="feedback-status" id="feedbackStatus" role="status" aria-live="polite" hidden></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</div><div class="actions" id="sendActions"><button class="button button-danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; End</span></button><button class="button" id="send">Send to Agent</button></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of Lavish. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The Lavish annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">Lavish is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
