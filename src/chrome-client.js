@@ -79,6 +79,12 @@ let pendingSubmission = loadPendingSubmission();
 let annotation = true;
 let ended = false;
 let agentPresence = "waiting";
+// The agent starts its first poll only after it reads the open output, and between rounds it
+// polls again only after replying, so short waits are normal. The banner appears only once
+// waiting has lasted this long without a break.
+const PRESENCE_BANNER_DELAY_MS = 20_000;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let presenceBannerTimer = null;
 let pendingSnapshot = "";
 const layoutGateEnabled = sessionData.layoutGateEnabled !== false;
 const configuredLayoutGateMaxHoldMs = Number(sessionData.layoutGateMaxHoldMs);
@@ -335,7 +341,7 @@ function syncChat(chat) {
 function setAgentPresence(state) {
   agentPresence = state === "listening" || state === "working" ? state : "waiting";
   updateSendState();
-  if (presenceBanner) presenceBanner.hidden = ended || agentPresence !== "waiting";
+  syncPresenceBanner();
 
   if (agentPresence !== "working") {
     if (workingBubble) workingBubble.remove();
@@ -992,6 +998,22 @@ async function endSession() {
   markSessionEnded();
 }
 
+function syncPresenceBanner() {
+  if (!presenceBanner) return;
+  if (ended || agentPresence !== "waiting") {
+    if (presenceBannerTimer) clearTimeout(presenceBannerTimer);
+    presenceBannerTimer = null;
+    presenceBanner.hidden = true;
+    return;
+  }
+  // A repeated "waiting" (a reconnect handshake) continues the current wait.
+  if (presenceBannerTimer || !presenceBanner.hidden) return;
+  presenceBannerTimer = setTimeout(() => {
+    presenceBannerTimer = null;
+    presenceBanner.hidden = ended || agentPresence !== "waiting";
+  }, PRESENCE_BANNER_DELAY_MS);
+}
+
 function markSessionEnded() {
   if (ended) return;
   ended = true;
@@ -1003,7 +1025,7 @@ function markSessionEnded() {
   moreButton.disabled = true;
   chatInput.disabled = true;
   updateSendState();
-  if (presenceBanner) presenceBanner.hidden = true;
+  syncPresenceBanner();
   if (handoffBanner) handoffBanner.hidden = true;
   layoutGateManuallyBypassed = true;
   revealLayoutGate();

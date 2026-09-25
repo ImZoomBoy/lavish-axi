@@ -206,6 +206,7 @@ async function createChromeHarness({
   element("shareDialog").hidden = true;
   element("moreMenu").hidden = true;
   element("warningsDrawer").hidden = true;
+  element("presenceBanner").hidden = true;
   const whiteboardFrame = element("whiteboardFrame");
   whiteboardFrame.contentWindow = {
     postMessage(message) {
@@ -411,6 +412,9 @@ async function createChromeHarness({
       for (const { handler } of documentListeners.get("mousedown") || []) handler({ target });
     },
     runTimers,
+    pendingTimers(ms) {
+      return [...timers.values()].filter((timer) => timer.ms === ms).length;
+    },
     srcLoads,
     beginRequests,
     artifactBeginRequests,
@@ -2360,6 +2364,80 @@ test("review page falls back to the event stream when a running server refuses t
   assert.equal(chrome.eventSources[0].url, "/events/abc");
   chrome.eventSources[0].listeners.get("agent-reply")({ data: JSON.stringify({ text: "Over the stream." }) });
   assert.match(chrome.element("chatLog").lastAppendedChild.innerHTML, /Over the stream\./);
+});
+
+test("presence banner shows only after 20 seconds of unbroken waiting, counted from page load", async () => {
+  const chrome = await createChromeHarness();
+  const banner = chrome.element("presenceBanner");
+  const presence = chrome.liveListener("agent-presence");
+
+  // The live handshake repeats the state the page loaded into; it must not restart the clock.
+  presence({ data: JSON.stringify({ state: "waiting" }) });
+  assert.equal(banner.hidden, true, "a page that loads into waiting does not show the banner at once");
+  assert.equal(chrome.pendingTimers(20000), 1, "one 20 second timer runs from page load");
+
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, false, "the banner shows after 20 seconds of waiting");
+
+  presence({ data: JSON.stringify({ state: "listening" }) });
+  assert.equal(banner.hidden, true, "the banner hides at once when presence leaves waiting");
+
+  presence({ data: JSON.stringify({ state: "waiting" }) });
+  assert.equal(banner.hidden, true, "a return to waiting starts a new 20 seconds");
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, false);
+});
+
+test("presence banner restarts its 20 seconds when waiting is broken", async () => {
+  const chrome = await createChromeHarness();
+  const banner = chrome.element("presenceBanner");
+  const presence = chrome.liveListener("agent-presence");
+
+  presence({ data: JSON.stringify({ state: "working" }) });
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, true, "the load timer is dropped once presence leaves waiting");
+  assert.equal(chrome.pendingTimers(20000), 0);
+
+  presence({ data: JSON.stringify({ state: "waiting" }) });
+  assert.equal(chrome.pendingTimers(20000), 1);
+  presence({ data: JSON.stringify({ state: "listening" }) });
+  presence({ data: JSON.stringify({ state: "waiting" }) });
+  assert.equal(chrome.pendingTimers(20000), 1, "a broken wait replaces its timer instead of adding one");
+  assert.equal(banner.hidden, true);
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, false);
+});
+
+test("presence banner stays hidden when the session ends during the wait", async () => {
+  const chrome = await createChromeHarness();
+  const banner = chrome.element("presenceBanner");
+
+  chrome.sendFrameMessage({ type: "lavish:endSession" });
+  await flushPromises();
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, true);
+});
+
+test("presence banner delay works over the event stream fallback", async () => {
+  const chrome = await createChromeHarness({
+    fetchImpl: async () => ({ ok: true, json: async () => ({}) }),
+  });
+  chrome.liveSockets[0].dispatch("close");
+  await flushPromises();
+  chrome.runTimers(500);
+  chrome.liveSockets[1].dispatch("close");
+  await flushPromises();
+  assert.equal(chrome.eventSources.length, 1);
+  const stream = chrome.eventSources[0];
+  const banner = chrome.element("presenceBanner");
+
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "listening" }) });
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "waiting" }) });
+  assert.equal(banner.hidden, true);
+  chrome.runTimers(20000);
+  assert.equal(banner.hidden, false);
+  stream.listeners.get("agent-presence")({ data: JSON.stringify({ state: "working" }) });
+  assert.equal(banner.hidden, true);
 });
 
 test("review page does not reconnect a socket the server closed for a restart", async () => {
