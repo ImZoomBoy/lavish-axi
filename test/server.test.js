@@ -682,12 +682,13 @@ test("chrome only marks session ended after the end request succeeds", async () 
 
 test("chrome shows a waiting banner when no agent has attached", async () => {
   const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
-  const js = await chromeClientSource();
   const css = await chromeCssSource();
 
-  assert.match(html, /id="presenceBanner"/);
-  assert.match(html, /Your agent is not listening/);
-  assert.match(js, /presenceBanner\.hidden = ended \|\| agentPresence !== "waiting"/);
+  const [, bannerText] = html.match(/<div class="presence-banner" id="presenceBanner" hidden>([^<]*)<\/div>/) || [];
+  assert.equal(
+    bannerText,
+    "Your agent is not checking for feedback right now. Anything you send is kept and reaches it on its next check.",
+  );
   assert.match(css, /\.presence-banner\{/);
 });
 
@@ -2970,18 +2971,77 @@ test("live agent-presence reflects waiting, listening, and working transitions",
     });
     const feedback = await pollPromise;
 
-    const waiting = await waitForPresence();
-    assert.equal(waiting, "waiting", "delivery alone should not imply the agent is processing feedback");
+    const working = await waitForPresence();
+    assert.equal(working, "working", "a delivered batch should read working once the poll releases");
     const acknowledged = await fetch(`${base}/api/${key}/feedback-ack`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ feedback_id: feedback.feedback_id }),
     });
     assert.equal(acknowledged.status, 200);
-    const working = await waitForPresence();
-    assert.equal(working, "working", "should switch to working only after the agent acknowledges processing");
+    await assert.rejects(presencePage.next("agent-presence", 300), /timed out/, "the ack should not change presence");
 
     await presencePage.close();
+  } finally {
+    await server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("live agent-presence reads working for an unacked batch that is redelivered, then listening on the next wait", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
+  const artifact = path.join(dir, "artifact.html");
+  await writeFile(artifact, "<!doctype html><html><body></body></html>");
+  const server = await serve({ port: 0, stateFile: path.join(dir, "state.json"), version: "9.9.9-test" });
+  try {
+    const base = `http://127.0.0.1:${server.port}`;
+    const open = await fetch(`${base}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file: artifact }),
+    });
+    const { key } = await open.json();
+    const pollUrl = `${base}/api/poll?file=${encodeURIComponent(artifact)}`;
+    const presence = await startPresenceStream(base, key);
+    try {
+      assert.equal(await presence.next(), "waiting");
+
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
+      });
+      const first = await (await fetch(pollUrl)).json();
+      assert.equal(first.status, "feedback");
+      assert.equal(await presence.next(), "working", "delivery with no poll attached should read working");
+
+      // The agent never acked, so the next poll gets the same batch back at once.
+      const again = await (await fetch(pollUrl)).json();
+      assert.equal(again.feedback_id, first.feedback_id);
+      const reconnected = await startPresenceStream(base, key);
+      try {
+        assert.equal(await reconnected.next(), "working", "a redelivered unacked batch should still read working");
+      } finally {
+        await reconnected.close();
+      }
+
+      await fetch(`${base}/api/${key}/feedback-ack`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ feedback_id: first.feedback_id }),
+      });
+      const waitingPoll = fetch(pollUrl).then((res) => res.text());
+      assert.equal(await presence.next(), "listening", "the next poll that waits should read listening");
+      await fetch(`${base}/api/${key}/prompts`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ prompts: [{ prompt: "second", tag: "message" }] }),
+      });
+      await waitingPoll;
+      assert.equal(await presence.next(), "working");
+    } finally {
+      await presence.close();
+    }
   } finally {
     await server.close();
     await rm(dir, { recursive: true, force: true });
@@ -3129,7 +3189,7 @@ test("heartbeat long-poll errors close the stream without Express error handling
   assert.match(source, /respond\(\)\.catch\(handleRespondError\)/);
 });
 
-test("live agent-presence switches to working after acknowledging immediately delivered feedback", async () => {
+test("live agent-presence switches to working when feedback is delivered immediately", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "lavish-serve-"));
   const artifact = path.join(dir, "artifact.html");
   await (await import("node:fs/promises")).writeFile(artifact, "<!doctype html><html><body></body></html>");
@@ -3247,8 +3307,7 @@ test("live agent-presence returns to waiting after an agent reply", async () => 
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ prompts: [{ prompt: "hello", tag: "message" }] }),
       });
-      // A poll that drains the feedback and releases leaves presence "waiting" until the
-      // agent acknowledges the batch; the acknowledgement is what marks it "working".
+      // A poll that drains the feedback and releases marks presence "working".
       const feedback = await (await fetch(`${base}/api/poll?file=${encodeURIComponent(artifact)}`)).json();
       await fetch(`${base}/api/${key}/feedback-ack`, {
         method: "POST",
