@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
@@ -25,6 +26,7 @@ import {
   createPollOutput,
   createPlaybookOutput,
   createServerSpawnOptions,
+  launchBrowser,
   createShareOutput,
   createUserEndedOpenOutput,
   detectInvokingAgent,
@@ -1986,6 +1988,10 @@ test("Copilot CLI ambient context script wraps lavish output as hook JSON", asyn
   }
 });
 
+test("copilot ambient context hook hides the shell console window on Windows", () => {
+  assert.match(createCopilotCliAmbientContextScript(), /shell: true, windowsHide: true/);
+});
+
 test("setup hooks installs agent session hooks explicitly", async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-state-`);
   const homeDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-setup-home-`);
@@ -2381,6 +2387,57 @@ test("server spawn options can persist detached server output to a log fd", () =
 
   assert.equal(options.detached, true);
   assert.deepEqual(options.stdio, ["ignore", 17, 17]);
+});
+
+test("server spawn options hide the detached server's console window on Windows", () => {
+  // Without windowsHide, Windows gives a detached child its own visible console window,
+  // which stays open as a black window for the server's whole lifetime.
+  assert.equal(createServerSpawnOptions().windowsHide, true);
+  assert.equal(createServerSpawnOptions(17).windowsHide, true);
+});
+
+test("browser launch on Windows uses a hidden GUI handler instead of a console shell", async () => {
+  const calls = [];
+  const fakeChild = Object.assign(new EventEmitter(), { unref() {} });
+  process.nextTick(() => fakeChild.emit("spawn"));
+  await launchBrowser("http://127.0.0.1:4555/session/abc?no-gate=1&x=1", {
+    platform: "win32",
+    spawn: (command, args, options) => {
+      calls.push({ command, args, options });
+      return fakeChild;
+    },
+    openUrl: async () => assert.fail("open must not run on Windows"),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, "rundll32.exe");
+  assert.deepEqual(calls[0].args, ["url.dll,FileProtocolHandler", "http://127.0.0.1:4555/session/abc?no-gate=1&x=1"]);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.equal(calls[0].options.detached, true);
+  assert.equal(calls[0].options.stdio, "ignore");
+});
+
+test("browser launch outside Windows delegates to open", async () => {
+  const opened = [];
+  await launchBrowser("http://127.0.0.1:4555/session/abc", {
+    platform: "darwin",
+    spawn: () => assert.fail("spawn must not run outside Windows"),
+    openUrl: async (url) => {
+      opened.push(url);
+    },
+  });
+  assert.deepEqual(opened, ["http://127.0.0.1:4555/session/abc"]);
+});
+
+test("browser launch on Windows rejects when the handler cannot start", async () => {
+  const fakeChild = Object.assign(new EventEmitter(), { unref() {} });
+  const pending = launchBrowser("http://127.0.0.1:4555/session/abc", {
+    platform: "win32",
+    spawn: () => fakeChild,
+    openUrl: async () => {},
+  });
+  fakeChild.emit("error", new Error("spawn rundll32.exe ENOENT"));
+  await assert.rejects(pending, /ENOENT/);
 });
 
 test("server entry resolves to a node-executable script that actually invokes run()", () => {

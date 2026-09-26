@@ -308,8 +308,7 @@ async function openCommand(args) {
   let status = "ready";
   if (shouldOpenBrowser(args, process.env)) {
     try {
-      const open = (await import("open")).default;
-      await open(response.url);
+      await launchBrowser(response.url);
       status = "launch-requested";
     } catch {
       // The launch failed, so the status stays "ready".
@@ -332,6 +331,39 @@ async function selfPaintWarningForFile(absolute) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Hands a URL to the system browser. On Windows `open` runs PowerShell, a console program,
+ * which flashes a console window when the CLI itself has none (agent harnesses usually run
+ * it without one); rundll32's URL handler is a GUI program, and windowsHide covers the rest.
+ * @param {string} url
+ * @typedef {{ on(event: string, listener: (...args: any[]) => void): unknown, unref(): void }} LaunchedChild
+ * @param {{ platform?: NodeJS.Platform, spawn?: (command: string, args: string[], options: import("node:child_process").SpawnOptions) => LaunchedChild, openUrl?: (url: string) => Promise<unknown> }} [deps]
+ */
+export async function launchBrowser(
+  url,
+  { platform = process.platform, spawn: spawnFn = spawn, openUrl = defaultOpenUrl } = {},
+) {
+  if (platform !== "win32") {
+    await openUrl(url);
+    return;
+  }
+  const child = spawnFn("rundll32.exe", ["url.dll,FileProtocolHandler", url], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  await new Promise((resolve, reject) => {
+    child.on("spawn", resolve);
+    child.on("error", reject);
+  });
+  child.unref();
+}
+
+async function defaultOpenUrl(url) {
+  const open = (await import("open")).default;
+  await open(url);
 }
 
 export function shouldOpenBrowser(args, env) {
@@ -1068,7 +1100,7 @@ export function createCopilotCliAmbientContextScript(command = "lavish-axi") {
   return [
     'const { spawnSync } = require("node:child_process");',
     `const command = ${JSON.stringify(command)};`,
-    'const result = spawnSync(command, [], { encoding: "utf8", shell: true });',
+    'const result = spawnSync(command, [], { encoding: "utf8", shell: true, windowsHide: true });',
     'const detail = result.error ? result.error.message : (result.stderr || result.stdout || "exit " + (result.status ?? "unknown"));',
     "const text = String(result.status === 0 ? result.stdout : detail).trim();",
     'if (!text) { console.log("{}"); process.exit(0); }',
@@ -1519,6 +1551,9 @@ export function createServerSpawnOptions(logFd = null) {
   return {
     detached: true,
     stdio,
+    // A detached child gets its own console window on Windows; without this it stays open
+    // as a black window for the server's whole lifetime.
+    windowsHide: true,
     env: { ...process.env, LAVISH_AXI_NO_OPEN: "1" },
   };
 }

@@ -367,3 +367,14 @@ test("plugin client launch preserves Windows batch arguments", { skip: process.p
     process.env.PATH = previousPath;
   }
 });
+
+test("plugin client spawns hide their console window on Windows", () => {
+  const calls = [];
+  spawnPluginClientSync("copilot", ["plugins", "list"], (command, args, options) => {
+    calls.push({ command, args, options });
+    return { status: 0, stdout: "", stderr: "" };
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.windowsHide, true);
+  assert.equal(calls[0].options.encoding, "utf8");
+});

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,15 +45,26 @@ const SHELLS = findShells();
 
 const END_OF_COMMAND = "--end-of-printed-command--";
 
+// Puts an executable `lavish-axi` stub on a fresh PATH entry. A shell function cannot stand in:
+// POSIX names cannot contain `-`, so dash (Debian/Ubuntu's /bin/sh) rejects `lavish-axi() {}`.
+async function withStubCli(body, run, baseEnv = process.env) {
+  const dir = await mkdtemp(`${os.tmpdir()}/lavish-axi-stub-cli-`);
+  try {
+    const stub = path.join(dir, "lavish-axi");
+    await writeFile(stub, `#!/bin/sh\n${body}\n`, "utf8");
+    await chmod(stub, 0o755);
+    return await run({ ...baseEnv, PATH: `${dir}${path.delimiter}${baseEnv.PATH || ""}` });
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+}
+
 // Runs printed commands in one shell where `lavish-axi` only prints the arguments it received,
 // one per line, so the test sees exactly what the shell did to each printed path. One shell run
 // per batch keeps the process count low.
-function argvsAfterShell(shell, commands) {
-  const script = [
-    `lavish-axi() { for arg in "$@"; do printf '%s\\n' "$arg"; done; printf '%s\\n' ${END_OF_COMMAND}; }`,
-    ...commands,
-  ].join("\n");
-  const result = spawnSync(shell, ["-c", script], { encoding: "utf8" });
+function argvsAfterShell(shell, commands, env) {
+  const script = commands.join("\n");
+  const result = spawnSync(shell, ["-c", script], { encoding: "utf8", env });
   assert.equal(result.status, 0, `${shell} failed on:\n${script}\n${result.stderr}`);
   const lines = result.stdout.replace(/\r/g, "").split("\n");
   const argvs = [[]];
@@ -113,19 +124,26 @@ const PATHS = [
   "/tmp/with space/it's $HOME/review.html",
 ];
 
-test("every printed command passes its file path through a shell unchanged", { skip: SHELLS.length === 0 }, () => {
-  for (const file of PATHS) {
-    const commands = allPrintedCommands(file);
-    assert.ok(commands.length >= 12, `expected the printed commands for ${file}, got ${commands.length}`);
-    for (const shell of SHELLS) {
-      const argvs = argvsAfterShell(shell, commands);
-      commands.forEach((command, index) => {
-        const argv = argvs[index];
-        assert.ok(argv.includes(file), `${shell} mangled the path in: ${command}\nargv: ${JSON.stringify(argv)}`);
-      });
-    }
-  }
-});
+test(
+  "every printed command passes its file path through a shell unchanged",
+  { skip: SHELLS.length === 0 },
+  async () => {
+    const echoArgs = `for arg in "$@"; do printf '%s\\n' "$arg"; done; printf '%s\\n' ${END_OF_COMMAND}`;
+    await withStubCli(echoArgs, async (env) => {
+      for (const file of PATHS) {
+        const commands = allPrintedCommands(file);
+        assert.ok(commands.length >= 12, `expected the printed commands for ${file}, got ${commands.length}`);
+        for (const shell of SHELLS) {
+          const argvs = argvsAfterShell(shell, commands, env);
+          commands.forEach((command, index) => {
+            const argv = argvs[index];
+            assert.ok(argv.includes(file), `${shell} mangled the path in: ${command}\nargv: ${JSON.stringify(argv)}`);
+          });
+        }
+      }
+    });
+  },
+);
 
 test("the printed poll command runs as printed from a shell", { skip: SHELLS.length === 0 }, async () => {
   const stateDir = await mkdtemp(`${os.tmpdir()}/lavish-axi-printed-command-test-`);
@@ -154,32 +172,38 @@ test("the printed poll command runs as printed from a shell", { skip: SHELLS.len
       url: "",
       status: "ready",
     });
-    for (const shell of SHELLS) {
-      const script = `lavish-axi() { "$LAVISH_NODE" "$LAVISH_CLI" "$@"; }\n${pollCommand} --timeout-ms 200`;
-      // Async spawn: the server runs on this process's event loop, which spawnSync would block.
-      const child = spawn(shell, ["-c", script], { cwd: REPO, env });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk.toString();
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk.toString();
-      });
-      const code = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          child.kill();
-          reject(new Error(`timed out running: ${pollCommand}`));
-        }, 20_000);
-        child.on("error", reject);
-        child.on("close", (exitCode) => {
-          clearTimeout(timer);
-          resolve(exitCode);
-        });
-      });
-      assert.equal(code, 0, `${shell} could not run: ${pollCommand}\n${stdout}\n${stderr}`);
-      assert.match(stdout, /status: waiting/);
-    }
+    await withStubCli(
+      'exec "$LAVISH_NODE" "$LAVISH_CLI" "$@"',
+      async (stubEnv) => {
+        for (const shell of SHELLS) {
+          const script = `${pollCommand} --timeout-ms 200`;
+          // Async spawn: the server runs on this process's event loop, which spawnSync would block.
+          const child = spawn(shell, ["-c", script], { cwd: REPO, env: stubEnv });
+          let stdout = "";
+          let stderr = "";
+          child.stdout.on("data", (chunk) => {
+            stdout += chunk.toString();
+          });
+          child.stderr.on("data", (chunk) => {
+            stderr += chunk.toString();
+          });
+          const code = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+              child.kill();
+              reject(new Error(`timed out running: ${pollCommand}`));
+            }, 20_000);
+            child.on("error", reject);
+            child.on("close", (exitCode) => {
+              clearTimeout(timer);
+              resolve(exitCode);
+            });
+          });
+          assert.equal(code, 0, `${shell} could not run: ${pollCommand}\n${stdout}\n${stderr}`);
+          assert.match(stdout, /status: waiting/);
+        }
+      },
+      env,
+    );
   } finally {
     await server.close();
     await rm(stateDir, { force: true, recursive: true });

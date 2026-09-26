@@ -26,8 +26,9 @@ export const PLUGIN_SCHEMA_URL = "https://agent-plugins.org/schemas/1.0.0/plugin
 // Not in package.json (npm infers no author), so the one authoritative copy lives here.
 const PLUGIN_AUTHOR = Object.freeze({ name: "Kun Chen", url: "https://github.com/kunchenguid" });
 
-export function spawnPluginClientSync(command, args) {
-  return crossSpawn.sync(command, args, { encoding: "utf8" });
+export function spawnPluginClientSync(command, args, spawnSync = crossSpawn.sync) {
+  // cross-spawn runs .cmd shims through cmd.exe, which flashes a console window unless hidden.
+  return spawnSync(command, args, { encoding: "utf8", windowsHide: true });
 }
 
 /**
