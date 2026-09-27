@@ -148,6 +148,14 @@ test("chrome sandbox does not grant modal prompts", () => {
   assert.doesNotMatch(html, /sandbox="[^"]*allow-modals/);
 });
 
+test("artifact frame allows full screen without loosening its sandbox", () => {
+  const html = createChromeHtml({ key: "abc", file: "/tmp/artifact.html" });
+  const frame = html.match(/<iframe id="artifact"[^>]*>/)?.[0] || "";
+
+  assert.match(frame, / allow="fullscreen"/);
+  assert.equal(frame.match(/sandbox="([^"]*)"/)?.[1], "allow-scripts allow-forms allow-popups allow-downloads");
+});
+
 test("artifact SDK uses a custom annotation card instead of browser prompts", () => {
   const js = createSdkJs("abc");
 
@@ -3592,7 +3600,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" allow="fullscreen" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);
