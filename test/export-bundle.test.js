@@ -70,6 +70,17 @@ test("inlines a local stylesheet link as a <style> block", async () => {
   assert.equal(warnings.length, 0);
 });
 
+test("keeps the full-screen permissions of videos and embeds", async () => {
+  const html =
+    '<!doctype html><html><body><video controls src="https://example.com/a.mp4"></video>' +
+    '<iframe src="https://example.com/reel/embed" allow="fullscreen; autoplay" allowfullscreen></iframe></body></html>';
+  const { html: out } = await buildSelfContainedHtml(html, { baseDir: "/art", readLocalFile: localReader({}) });
+
+  assert.match(out, /<video controls src="https:\/\/example\.com\/a\.mp4"><\/video>/);
+  assert.match(out, /<iframe src="https:\/\/example\.com\/reel\/embed" allow="fullscreen; autoplay" allowfullscreen>/);
+  assert.doesNotMatch(out, /sandbox=/);
+});
+
 test("scrubs file URLs from generated stylesheet media attributes", async () => {
   const html =
     '<!doctype html><html><head><link rel="stylesheet" href="theme.css" media="file:///Users/kun/secret"></head></html>';

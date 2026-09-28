@@ -636,6 +636,18 @@ export function createArtifactSdk(
     return isNativeInteractive(el);
   }
 
+  // Events Annotate mode leaves to the page. While an element is full screen, an annotation card
+  // could not show over it, so clicks there go to the page too, such as a click that pauses a video.
+  function leavesEventToPage(event) {
+    return (
+      !annotationMode ||
+      !!document.fullscreenElement ||
+      isLavishUi(event.target) ||
+      isLavishAction(event.target) ||
+      isInteractiveControl(event.target)
+    );
+  }
+
   function highlightElement(el) {
     if (!el) return;
     el.style.outline = "var(--lavish-annotate-outline,2px solid #f4c95d)";
@@ -1815,13 +1827,7 @@ export function createArtifactSdk(
   document.addEventListener(
     "mouseover",
     (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
+      if (leavesEventToPage(event)) return;
       const target = annotationTargetEl(event.target);
       if (target === selected) return;
       if (hovered && hovered !== selected) clearHighlight(hovered);
@@ -1845,13 +1851,7 @@ export function createArtifactSdk(
   document.addEventListener(
     "mouseup",
     (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
+      if (leavesEventToPage(event)) return;
 
       const c = textSelectionContext(document.getSelection());
       if (!c) return;
@@ -1865,13 +1865,7 @@ export function createArtifactSdk(
   document.addEventListener(
     "click",
     (event) => {
-      if (
-        !annotationMode ||
-        isLavishUi(event.target) ||
-        isLavishAction(event.target) ||
-        isInteractiveControl(event.target)
-      )
-        return;
+      if (leavesEventToPage(event)) return;
       event.preventDefault();
       event.stopPropagation();
       if (ignoreNextClick) {
