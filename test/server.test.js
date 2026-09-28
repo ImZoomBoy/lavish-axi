@@ -153,6 +153,8 @@ test("artifact frame allows full screen without loosening its sandbox", () => {
   const frame = html.match(/<iframe id="artifact"[^>]*>/)?.[0] || "";
 
   assert.match(frame, / allow="fullscreen"/);
+  // Older Safari reads only the legacy attribute.
+  assert.match(frame, / allowfullscreen[ >]/);
   assert.equal(frame.match(/sandbox="([^"]*)"/)?.[1], "allow-scripts allow-forms allow-popups allow-downloads");
 });
 
@@ -3600,7 +3602,7 @@ test("layout gate curtain reuses the ended overlay card styling", async () => {
   assert.match(html, /<body class="lavish layout-gate-active">/);
   assert.match(
     html,
-    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" allow="fullscreen" data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
+    /<iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" allow="fullscreen" allowfullscreen data-artifact-src="\/artifact\/abc\/index\.html"><\/iframe>/,
   );
   assert.doesNotMatch(html, /<iframe id="artifact"[^>]* src=/);
   assert.match(html, /class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"/);
