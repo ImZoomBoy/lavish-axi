@@ -308,8 +308,7 @@ async function openCommand(args) {
   let status = "ready";
   if (shouldOpenBrowser(args, process.env)) {
     try {
-      const open = (await import("open")).default;
-      await open(response.url);
+      await openBrowser(response.url);
       status = "launch-requested";
     } catch {
       // The launch failed, so the status stays "ready".
@@ -336,6 +335,34 @@ async function selfPaintWarningForFile(absolute) {
 
 export function shouldOpenBrowser(args, env) {
   return !args.includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
+}
+
+// `open` starts PowerShell on win32 with no windowsHide, and that console window flashes on
+// screen, so win32 launches the browser itself. rundll32 is a GUI program, so starting it shows
+// no window, and FileProtocolHandler opens the URL the way a shell open does.
+export function windowsBrowserArgs(url) {
+  return ["url.dll,FileProtocolHandler", url];
+}
+
+function launchBrowserOnWindows(url) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("rundll32.exe", windowsBrowserArgs(url), {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+async function openBrowser(url) {
+  if (process.platform === "win32") return launchBrowserOnWindows(url);
+  const open = (await import("open")).default;
+  await open(url);
 }
 
 async function pollCommand(args) {
@@ -1442,8 +1469,8 @@ async function waitForPortFree(baseUrl, timeoutMs) {
 
 // Last-resort fallback for the bootstrap upgrade case: a pre-handshake server is squatting
 // on the port and doesn't expose /shutdown, so we resolve its PID via lsof and SIGTERM it.
-// macOS/Linux only - Windows users would need to kill manually, but lavish-axi isn't
-// shipped for Windows today.
+// lsof is missing on Windows, so the spawn fails and nothing is killed there; Windows users
+// stop the process on that port by hand.
 function killProcessOnPort(port) {
   try {
     const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8", windowsHide: true });

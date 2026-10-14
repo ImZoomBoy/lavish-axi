@@ -122,7 +122,7 @@ test("real Excalidraw rendering keeps loaded-font labels inside their text bound
           "--dump-dom",
           `http://127.0.0.1:${port}/`,
         ],
-        { maxBuffer: 8 * 1024 * 1024, timeout: 75_000 },
+        { maxBuffer: 8 * 1024 * 1024, timeout: 75_000, windowsHide: true },
       );
       const result = resultFromDump(stdout);
       assert.ok(result, "browser fixture did not report a result");
