@@ -1068,7 +1068,7 @@ export function createCopilotCliAmbientContextScript(command = "lavish-axi") {
   return [
     'const { spawnSync } = require("node:child_process");',
     `const command = ${JSON.stringify(command)};`,
-    'const result = spawnSync(command, [], { encoding: "utf8", shell: true });',
+    'const result = spawnSync(command, [], { encoding: "utf8", shell: true, windowsHide: true });',
     'const detail = result.error ? result.error.message : (result.stderr || result.stdout || "exit " + (result.status ?? "unknown"));',
     "const text = String(result.status === 0 ? result.stdout : detail).trim();",
     'if (!text) { console.log("{}"); process.exit(0); }',
@@ -1446,7 +1446,7 @@ async function waitForPortFree(baseUrl, timeoutMs) {
 // shipped for Windows today.
 function killProcessOnPort(port) {
   try {
-    const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8", windowsHide: true });
     if (result.status !== 0) return;
     for (const line of result.stdout.split("\n")) {
       const pid = Number(line.trim());
@@ -1465,12 +1465,12 @@ function killProcessOnPort(port) {
 
 function processOnPortMatchesLavish(port) {
   try {
-    const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8", windowsHide: true });
     if (pids.status !== 0) return false;
     for (const line of pids.stdout.split("\n")) {
       const pid = Number(line.trim());
       if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-      const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+      const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", windowsHide: true });
       if (command.status === 0 && /lavish-axi/.test(command.stdout)) {
         return true;
       }
@@ -1520,6 +1520,7 @@ export function createServerSpawnOptions(logFd = null) {
     detached: true,
     stdio,
     env: { ...process.env, LAVISH_AXI_NO_OPEN: "1" },
+    windowsHide: true,
   };
 }
 

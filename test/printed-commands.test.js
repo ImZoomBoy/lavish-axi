@@ -32,7 +32,7 @@ function findShells() {
   if (process.platform !== "win32") {
     return ["/bin/sh", "/bin/bash"].filter((shell) => existsSync(shell));
   }
-  const execPath = spawnSync("git", ["--exec-path"], { encoding: "utf8" }).stdout?.trim();
+  const execPath = spawnSync("git", ["--exec-path"], { encoding: "utf8", windowsHide: true }).stdout?.trim();
   const candidates = [
     execPath ? path.resolve(execPath, "..", "..", "..", "bin", "bash.exe") : "",
     "C:\\Program Files\\Git\\bin\\bash.exe",
@@ -53,7 +53,7 @@ function argvsAfterShell(shell, commands) {
     `lavish-axi() { for arg in "$@"; do printf '%s\\n' "$arg"; done; printf '%s\\n' ${END_OF_COMMAND}; }`,
     ...commands,
   ].join("\n");
-  const result = spawnSync(shell, ["-c", script], { encoding: "utf8" });
+  const result = spawnSync(shell, ["-c", script], { encoding: "utf8", windowsHide: true });
   assert.equal(result.status, 0, `${shell} failed on:\n${script}\n${result.stderr}`);
   const lines = result.stdout.replace(/\r/g, "").split("\n");
   const argvs = [[]];
@@ -157,7 +157,7 @@ test("the printed poll command runs as printed from a shell", { skip: SHELLS.len
     for (const shell of SHELLS) {
       const script = `lavish-axi() { "$LAVISH_NODE" "$LAVISH_CLI" "$@"; }\n${pollCommand} --timeout-ms 200`;
       // Async spawn: the server runs on this process's event loop, which spawnSync would block.
-      const child = spawn(shell, ["-c", script], { cwd: REPO, env });
+      const child = spawn(shell, ["-c", script], { cwd: REPO, env, windowsHide: true });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (chunk) => {

@@ -27,7 +27,7 @@ export const PLUGIN_SCHEMA_URL = "https://agent-plugins.org/schemas/1.0.0/plugin
 const PLUGIN_AUTHOR = Object.freeze({ name: "Kun Chen", url: "https://github.com/kunchenguid" });
 
 export function spawnPluginClientSync(command, args) {
-  return crossSpawn.sync(command, args, { encoding: "utf8" });
+  return crossSpawn.sync(command, args, { encoding: "utf8", windowsHide: true });
 }
 
 /**

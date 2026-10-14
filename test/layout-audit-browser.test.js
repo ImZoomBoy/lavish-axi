@@ -17,6 +17,7 @@ function run(command, args, env, timeout = 45_000) {
     env: { ...process.env, ...env },
     encoding: "utf8",
     timeout,
+    windowsHide: true,
   });
   if (result.error) throw result.error;
   assert.equal(result.status, 0, `${command} ${args.join(" ")}\n${result.stdout}\n${result.stderr}`);

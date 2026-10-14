@@ -298,6 +298,7 @@ test("top-level help renders static home output without dynamic sessions", async
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir },
+        windowsHide: true,
       },
     );
 
@@ -914,6 +915,7 @@ test("export command writes a portable HTML file next to the artifact", async ()
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, LAVISH_AXI_STATE_DIR: dir, LAVISH_AXI_TELEMETRY: "0" },
         encoding: "utf8",
+        windowsHide: true,
       },
     );
 
@@ -942,6 +944,7 @@ test("export command treats --out value as an option operand, not the source fil
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, LAVISH_AXI_STATE_DIR: dir, LAVISH_AXI_TELEMETRY: "0" },
         encoding: "utf8",
+        windowsHide: true,
       },
     );
 
@@ -1066,6 +1069,7 @@ test("share command publishes the artifact to ht-ml.app and returns the public u
           LAVISH_AXI_TELEMETRY: "0",
           LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
         },
+        windowsHide: true,
       },
     );
     let stdout = "";
@@ -1111,6 +1115,7 @@ test("share command treats a whitespace-only password as public", async () => {
           LAVISH_AXI_TELEMETRY: "0",
           LAVISH_AXI_HTML_APP_API_URL: `http://127.0.0.1:${htmlApp.port}`,
         },
+        windowsHide: true,
       },
     );
     let stdout = "";
@@ -1561,6 +1566,7 @@ test("spawned poll with piped stderr banners once and leaves re-run guidance whe
       {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
+        windowsHide: true,
       },
     );
 
@@ -1619,6 +1625,7 @@ test("spawned poll delivers a feedback batch and the ack command confirms proces
       {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
+        windowsHide: true,
       },
     );
     let stdout = "";
@@ -1640,6 +1647,7 @@ test("spawned poll delivers a feedback batch and the ack command confirms proces
       {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         env: { ...process.env, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_PORT: String(server.port) },
+        windowsHide: true,
       },
     );
     let ackStdout = "";
@@ -1666,6 +1674,7 @@ function spawnCli(args, env) {
   const child = spawn(process.execPath, [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), ...args], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
     env,
+    windowsHide: true,
   });
   const output = { stdout: "", stderr: "" };
   child.stdout.on("data", (chunk) => {
@@ -1975,6 +1984,7 @@ test("Copilot CLI ambient context script wraps lavish output as hook JSON", asyn
     const command = `"${process.execPath}" "${fakeCli}"`;
     const result = spawnSync(process.execPath, ["-e", createCopilotCliAmbientContextScript(command)], {
       encoding: "utf8",
+      windowsHide: true,
     });
 
     assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1997,6 +2007,7 @@ test("setup hooks installs agent session hooks explicitly", async () => {
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: setupHooksEnv(homeDir, stateDir),
+        windowsHide: true,
       },
     );
 
@@ -2033,6 +2044,7 @@ test("setup hooks exits with an error when hook installation fails", async () =>
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: setupHooksEnv(homeDir, stateDir),
+        windowsHide: true,
       },
     );
 
@@ -2063,6 +2075,7 @@ function runSetupPlugin(homeDir, stateDir, pathDir) {
       cwd: fileURLToPath(new URL("..", import.meta.url)),
       encoding: "utf8",
       env: setupPluginEnv(homeDir, stateDir, pathDir),
+      windowsHide: true,
     },
   );
 }
@@ -2347,6 +2360,7 @@ test("setup rejects an unknown action and names both supported ones", async () =
         cwd: fileURLToPath(new URL("..", import.meta.url)),
         encoding: "utf8",
         env: setupHooksEnv(homeDir, stateDir),
+        windowsHide: true,
       },
     );
 
