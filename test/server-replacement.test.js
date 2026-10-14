@@ -13,7 +13,7 @@ import { VERSION } from "../src/cli.js";
 
 // The CLI reads open connections with netstat on Windows and lsof elsewhere.
 const CANNOT_LIST_CONNECTIONS =
-  process.platform !== "win32" && spawnSync("lsof", ["-v"], { encoding: "utf8" }).error
+  process.platform !== "win32" && spawnSync("lsof", ["-v"], { encoding: "utf8", windowsHide: true }).error
     ? "lsof is not installed"
     : false;
 
@@ -21,6 +21,7 @@ function spawnCli(args, env) {
   const child = spawn(process.execPath, [fileURLToPath(new URL("../bin/lavish-axi.js", import.meta.url)), ...args], {
     cwd: fileURLToPath(new URL("..", import.meta.url)),
     env,
+    windowsHide: true,
   });
   const output = { stdout: "", stderr: "" };
   child.stdout.on("data", (chunk) => {

@@ -80,7 +80,7 @@ test("--version prints the version fast and skips telemetry and state-dir init",
     const timings = [];
     for (let attempt = 0; attempt < VERSION_ATTEMPTS; attempt += 1) {
       const startedAt = process.hrtime.bigint();
-      const { stdout } = await execFileAsync(process.execPath, [BIN, flag], { env });
+      const { stdout } = await execFileAsync(process.execPath, [BIN, flag], { env, windowsHide: true });
       timings.push(Math.round(Number(process.hrtime.bigint() - startedAt) / 1e6));
       assert.equal(stdout, `${VERSION}\n`);
       if (timings[timings.length - 1] < VERSION_BUDGET_MS) break;
@@ -114,6 +114,7 @@ test("a non-version invocation still runs the telemetry init the fast path skips
       LAVISH_AXI_UMAMI_WEBSITE_ID: "version-fast-path-test",
       LAVISH_AXI_UMAMI_HOST: telemetry.host,
     },
+    windowsHide: true,
   });
 
   assert.ok(telemetry.requests.length > 0, "expected the control command to send telemetry");

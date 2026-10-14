@@ -59,7 +59,7 @@ export async function launchChrome(profileDir) {
       "--disable-renderer-backgrounding",
       "about:blank",
     ],
-    { stdio: "ignore" },
+    { stdio: "ignore", windowsHide: true },
   );
   const portFile = path.join(profileDir, "DevToolsActivePort");
   await waitFor(async () => existsSync(portFile) || "waiting", 20_000, "Chrome did not start");

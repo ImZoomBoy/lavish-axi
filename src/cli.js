@@ -308,8 +308,7 @@ async function openCommand(args) {
   let status = "ready";
   if (shouldOpenBrowser(args, process.env)) {
     try {
-      const open = (await import("open")).default;
-      await open(response.url);
+      await openBrowser(response.url);
       status = "launch-requested";
     } catch {
       // The launch failed, so the status stays "ready".
@@ -336,6 +335,34 @@ async function selfPaintWarningForFile(absolute) {
 
 export function shouldOpenBrowser(args, env) {
   return !args.includes("--no-open") && env.LAVISH_AXI_NO_OPEN !== "1";
+}
+
+// `open` starts PowerShell on win32 with no windowsHide, and that console window flashes on
+// screen, so win32 launches the browser itself. rundll32 is a GUI program, so starting it shows
+// no window, and FileProtocolHandler opens the URL the way a shell open does.
+export function windowsBrowserArgs(url) {
+  return ["url.dll,FileProtocolHandler", url];
+}
+
+function launchBrowserOnWindows(url) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("rundll32.exe", windowsBrowserArgs(url), {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
+}
+
+async function openBrowser(url) {
+  if (process.platform === "win32") return launchBrowserOnWindows(url);
+  const open = (await import("open")).default;
+  await open(url);
 }
 
 async function pollCommand(args) {
@@ -1068,7 +1095,7 @@ export function createCopilotCliAmbientContextScript(command = "lavish-axi") {
   return [
     'const { spawnSync } = require("node:child_process");',
     `const command = ${JSON.stringify(command)};`,
-    'const result = spawnSync(command, [], { encoding: "utf8", shell: true });',
+    'const result = spawnSync(command, [], { encoding: "utf8", shell: true, windowsHide: true });',
     'const detail = result.error ? result.error.message : (result.stderr || result.stdout || "exit " + (result.status ?? "unknown"));',
     "const text = String(result.status === 0 ? result.stdout : detail).trim();",
     'if (!text) { console.log("{}"); process.exit(0); }',
@@ -1442,11 +1469,11 @@ async function waitForPortFree(baseUrl, timeoutMs) {
 
 // Last-resort fallback for the bootstrap upgrade case: a pre-handshake server is squatting
 // on the port and doesn't expose /shutdown, so we resolve its PID via lsof and SIGTERM it.
-// macOS/Linux only - Windows users would need to kill manually, but lavish-axi isn't
-// shipped for Windows today.
+// lsof is missing on Windows, so the spawn fails and nothing is killed there; Windows users
+// stop the process on that port by hand.
 function killProcessOnPort(port) {
   try {
-    const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    const result = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8", windowsHide: true });
     if (result.status !== 0) return;
     for (const line of result.stdout.split("\n")) {
       const pid = Number(line.trim());
@@ -1465,12 +1492,12 @@ function killProcessOnPort(port) {
 
 function processOnPortMatchesLavish(port) {
   try {
-    const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8" });
+    const pids = spawnSync("lsof", ["-t", `-iTCP:${port}`, "-sTCP:LISTEN"], { encoding: "utf8", windowsHide: true });
     if (pids.status !== 0) return false;
     for (const line of pids.stdout.split("\n")) {
       const pid = Number(line.trim());
       if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-      const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+      const command = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", windowsHide: true });
       if (command.status === 0 && /lavish-axi/.test(command.stdout)) {
         return true;
       }
@@ -1520,6 +1547,7 @@ export function createServerSpawnOptions(logFd = null) {
     detached: true,
     stdio,
     env: { ...process.env, LAVISH_AXI_NO_OPEN: "1" },
+    windowsHide: true,
   };
 }
 
